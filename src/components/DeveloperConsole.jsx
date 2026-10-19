@@ -13,8 +13,7 @@ import {
   Video,
   Radio
 } from 'lucide-react';
-
-const API_BASE = import.meta.env.VITE_API_URL || '';
+import { API_BASE } from '../config';
 
 export default function DeveloperConsole({ onSwitchToCivilian, userPos, onSpotCreated }) {
   const [activeDevTab, setActiveDevTab] = useState('cctv'); // 'cctv' | 'add-slot' | 'ledger'

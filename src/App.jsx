@@ -20,8 +20,7 @@ import {
   Zap,
   X
 } from 'lucide-react';
-
-const API_BASE = import.meta.env.VITE_API_URL || '';
+import { API_BASE } from './config';
 
 const CITIES = [
   {"name": "Connaught Place, New Delhi", "lat": 28.6315, "lng": 77.2195, "desc": "Central Delhi"},

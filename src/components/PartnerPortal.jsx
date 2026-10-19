@@ -8,8 +8,7 @@ import {
   RefreshCw,
   LocateFixed
 } from 'lucide-react';
-
-const API_BASE = import.meta.env.VITE_API_URL || '';
+import { API_BASE } from '../config';
 
 export default function PartnerPortal({ onBackToMap, userPos, onSpotAdded }) {
   const [ledger, setLedger] = useState(null);

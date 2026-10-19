@@ -9,6 +9,7 @@ and Mall Partner reservations with transparent 10%/90% revenue splits.
 import base64
 import math
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -43,12 +44,28 @@ except ImportError:
     )
     from partner_engine import PartnerEngine, haversine_meters
 
+class SlashNormalizerMiddleware:
+    """Normalizes multiple consecutive slashes in the path (e.g. //api/spots -> /api/spots)."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if "//" in path:
+                scope["path"] = re.sub(r"/+", "/", path)
+                raw_path = scope.get("raw_path", b"")
+                if b"//" in raw_path:
+                    scope["raw_path"] = re.sub(rb"/+", b"/", raw_path)
+        await self.app(scope, receive, send)
+
 app = FastAPI(
     title="ParkGrid Production API",
     description="Real-time smart parking search, OpenCV God's eye curb measurement & 10% mall ledger",
     version="2.0.0",
 )
 
+app.add_middleware(SlashNormalizerMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1007,7 +1024,7 @@ if os.path.exists(DIST_DIR):
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         # Do not intercept API calls
-        if full_path.startswith("api"):
+        if full_path.lstrip("/").startswith("api"):
             raise HTTPException(status_code=404, detail="API endpoint not found")
         target_file = os.path.join(DIST_DIR, full_path)
         if os.path.isfile(target_file):

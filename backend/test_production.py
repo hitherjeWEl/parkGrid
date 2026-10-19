@@ -67,4 +67,13 @@ r_health = client.get('/api/health')
 assert r_health.status_code == 200, f'Health failed: {r_health.status_code}'
 print(f'8. System Health: {r_health.json()["status"]}, Spots count = {r_health.json()["live_parking_spots"]}')
 
+# 9. Test Double Slash URL Normalization (regression test for Render & Netlify trailing slash)
+r_slash_spots = client.get('http://testserver//api/spots?lat=28.6315&lng=77.2195&vehicle_type=Sedan')
+assert r_slash_spots.status_code == 200, f'Double slash normalization failed on spots: {r_slash_spots.status_code}'
+assert len(r_slash_spots.json()['spots']) > 0, 'No spots returned via double slash URL'
+
+r_slash_health = client.get('http://testserver//api/health')
+assert r_slash_health.status_code == 200, f'Double slash normalization failed on health: {r_slash_health.status_code}'
+print('9. Double Slash URL Normalization (//api/spots, //api/health): PASSED')
+
 print('\n>>> ALL PRODUCTION INTEGRATION TESTS PASSED WITH 100% SUCCESS! <<<')

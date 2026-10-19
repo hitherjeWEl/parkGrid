@@ -10,8 +10,7 @@ import {
   Play, 
   Square
 } from 'lucide-react';
-
-const API_BASE = import.meta.env.VITE_API_URL || '';
+import { API_BASE } from '../config';
 
 export default function GodsEyeModal({ onClose, onSpotPublished }) {
   const [subTab, setSubTab] = useState('radar'); // 'radar' | 'camera'
