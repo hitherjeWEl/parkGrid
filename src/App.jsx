@@ -1,826 +1,724 @@
-import React, { useEffect, useRef, useState } from "react";
-import L from "leaflet";
-import "leaflet/dist/leaflet.css";
-import "./App.css";
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import './App.css';
 
-// Automatically uses your live Render backend URL in production, or localhost in VS Code
-const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+import Navbar from './components/Navbar';
+import SpotCard from './components/SpotCard';
+import SpotDetailDrawer from './components/SpotDetailDrawer';
+import ActivePassCard from './components/ActivePassCard';
+import NavigationBanner from './components/NavigationBanner';
+import DeveloperConsole from './components/DeveloperConsole';
+import MobileBottomNav from './components/MobileBottomNav';
+
+import { 
+  Search, 
+  MapPin, 
+  LocateFixed, 
+  Sparkles, 
+  Building2,
+  Zap,
+  X
+} from 'lucide-react';
+
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
+const CITIES = [
+  {"name": "Connaught Place, New Delhi", "lat": 28.6315, "lng": 77.2195, "desc": "Central Delhi"},
+  {"name": "Saket District Centre, South Delhi", "lat": 28.5283, "lng": 77.2185, "desc": "South Delhi Commercial Hub"},
+  {"name": "DLF CyberHub, Gurugram", "lat": 28.4952, "lng": 77.0890, "desc": "Cyber City Tech Corridor"},
+  {"name": "Hazratganj, Lucknow", "lat": 26.8505, "lng": 80.9463, "desc": "Heritage Market & Parking Hub"},
+  {"name": "Phoenix Palassio, Lucknow", "lat": 26.8143, "lng": 81.0076, "desc": "Amar Shaheed Path"},
+  {"name": "BKC, Mumbai", "lat": 19.0657, "lng": 72.8687, "desc": "Bandra Kurla Business District"},
+  {"name": "Indiranagar, Bengaluru", "lat": 12.9719, "lng": 77.6412, "desc": "100 Feet Road Grid"},
+];
 
 export default function App() {
-  const isPartnerPortal = new URLSearchParams(window.location.search).get("role") === "partner";
+  // Check if URL specifies developer mode
+  const initialIsDev = 
+    window.location.pathname.startsWith('/developer') ||
+    new URLSearchParams(window.location.search).get('mode') === 'developer' ||
+    new URLSearchParams(window.location.search).get('role') === 'developer' ||
+    new URLSearchParams(window.location.search).get('role') === 'partner';
 
-  // Consumer State
+  const [isDeveloperMode, setIsDeveloperMode] = useState(initialIsDev);
+
+  // Civilian Geolocation State
   const [userPos, setUserPos] = useState({ lat: 28.6315, lng: 77.2195 });
   const [userSpeedKmh, setUserSpeedKmh] = useState(0);
   const [gpsLocked, setGpsLocked] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [spots, setSpots] = useState([]);
-  const [filter, setFilter] = useState("all");
-  const [selectedSpot, setSelectedSpot] = useState(null);
-  const [routeInfo, setRouteInfo] = useState(null);
-  const [vehicleNo, setVehicleNo] = useState("");
-  const [hours, setHours] = useState(1);
-  const [activePass, setActivePass] = useState(null);
+  const [selectedCity, setSelectedCity] = useState(CITIES[0].name);
 
-  // Hands-Free Live Navigation State
+  // Search & Spots
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [spots, setSpots] = useState([]);
+  const [categoryFilter, setCategoryFilter] = useState('all'); // 'all' | 'paid' | 'free' | 'ev'
+  const [vehicleFilter, setVehicleFilter] = useState('all'); // 'all' | 'Hatchback' | 'Sedan' | 'SUV' | 'Two-Wheeler'
+  const [selectedSpot, setSelectedSpot] = useState(null);
+  const [loadingSpots, setLoadingSpots] = useState(false);
+
+  // Navigation & Routing State
+  const [routeInfo, setRouteInfo] = useState(null);
   const [navSteps, setNavSteps] = useState([]);
   const [navActive, setNavActive] = useState(false);
   const [currentStepIdx, setCurrentStepIdx] = useState(0);
   const [distToNextTurnM, setDistToNextTurnM] = useState(null);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
-  const announced150mRef = useRef(false);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const simulationTimerRef = useRef(null);
 
-  // Map Refs
+  // Digital Pass State (persisted in localStorage)
+  const [activePass, setActivePass] = useState(() => {
+    try {
+      const saved = localStorage.getItem('parkgrid_active_pass');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  // Mobile Drawer State ('collapsed' | 'half' | 'expanded')
+  const [mobileDrawerState, setMobileDrawerState] = useState('half');
+
+  // Map References
   const mapRef = useRef(null);
+  const mapContainerRef = useRef(null);
   const markersLayerRef = useRef(null);
   const routeLayerRef = useRef(null);
+  const carMarkerRef = useRef(null);
   const routeCoordsRef = useRef([]);
 
-  // Partner & Live Camera State (?role=partner)
-  const [ledger, setLedger] = useState(null);
-  const videoRef = useRef(null);
-  const [cameraActive, setCameraActive] = useState(false);
-  const [autoScan, setAutoScan] = useState(false);
-  const [cvResult, setCvResult] = useState(null);
-  const [camConfig, setCamConfig] = useState({
-    spot_id: "CP_BLK_A",
-    name: "CP Inner Circle — Block A Curb",
-    lat: 28.6328,
-    lng: 77.2197,
-    strip_width_meters: 14.0,
-  });
-  const [newLot, setNewLot] = useState({
-    name: "",
-    spot_type: "mall",
-    lat: 28.6315,
-    lng: 77.2195,
-    total_slots: 25,
-    price_per_hour: 40,
-  });
+  // Save active pass to localStorage
+  useEffect(() => {
+    if (activePass) {
+      localStorage.setItem('parkgrid_active_pass', JSON.stringify(activePass));
+    } else {
+      localStorage.removeItem('parkgrid_active_pass');
+    }
+  }, [activePass]);
 
-  function speakInstruction(text) {
-    if (!voiceEnabled || !("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 1.02;
-    window.speechSynthesis.speak(utterance);
-  }
+  // Voice Guidance (Civilian navigation)
+  const speakInstruction = useCallback((text) => {
+    if (!voiceEnabled || !('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = 1.05;
+      window.speechSynthesis.speak(utterance);
+    } catch (e) {
+      console.warn('Speech synthesis error:', e);
+    }
+  }, [voiceEnabled]);
 
   function formatManeuver(step) {
-    const type = step.maneuver?.type || "continue";
-    const modifier = step.maneuver?.modifier || "";
-    const road = step.name ? ` onto ${step.name}` : "";
-    if (type === "depart") return `Head ${modifier || "straight"}${road}`;
-    if (type === "arrive") return `You have arrived at your parking spot`;
-    if (type === "turn") return `Turn ${modifier}${road}`;
-    if (type === "roundabout" || type === "rotary") return `Take rotary exit${road}`;
-    return `Continue ${modifier || "straight"}${road}`;
+    const type = step.maneuver?.type || 'continue';
+    const modifier = step.maneuver?.modifier || '';
+    const road = step.name ? ` onto ${step.name}` : '';
+    if (type === 'depart') return `Head ${modifier || 'forward'}${road}`;
+    if (type === 'arrive') return `You have arrived at your parking location`;
+    if (type === 'turn') return `Turn ${modifier || 'ahead'}${road}`;
+    if (type === 'roundabout' || type === 'rotary') return `Take roundabout exit${road}`;
+    return `Continue ${modifier || 'straight'}${road}`;
   }
 
-  // 1. Continuous High-Frequency Live GPS Tracking (100% Hands-Free)
+  // 1. Live GPS Tracking via Geolocation API
   useEffect(() => {
-    if (!("geolocation" in navigator)) return;
-    const id = navigator.geolocation.watchPosition(
+    if (!('geolocation' in navigator)) return;
+    const watchId = navigator.geolocation.watchPosition(
       (pos) => {
+        if (isSimulating) return;
+
         const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
         const speedMs = pos.coords.speed || 0;
         setUserPos(coords);
         setUserSpeedKmh(Math.max(0, Math.round(speedMs * 3.6)));
         setGpsLocked(true);
       },
-      () => setGpsLocked(false),
-      { enableHighAccuracy: true, maximumAge: 1000, timeout: 8000 }
+      (err) => {
+        console.info('GPS not locked, running on default city anchor:', err.message);
+        setGpsLocked(false);
+      },
+      { enableHighAccuracy: true, maximumAge: 2000, timeout: 9000 }
     );
-    return () => navigator.geolocation.clearWatch(id);
-  }, []);
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [isSimulating]);
 
-  // 2. Live Hands-Free Turn-by-Turn Engine (Camera Lock + Live Countdown + Auto-Reroute)
-  useEffect(() => {
-    if (!navActive || navSteps.length === 0) return;
+  // 2. Fetch Spots from Backend
+  const fetchSpots = useCallback((lat, lng) => {
+    setLoadingSpots(true);
+    let backendSpotType = 'all';
+    if (categoryFilter === 'paid') backendSpotType = 'mall';
+    if (categoryFilter === 'free') backendSpotType = 'street';
 
-    // A. Keep Map Camera Locked onto Moving Car
-    if (mapRef.current) {
-      mapRef.current.panTo([userPos.lat, userPos.lng], { animate: true });
-    }
+    const params = new URLSearchParams({
+      lat: String(lat),
+      lng: String(lng),
+      radius_km: '15.0',
+      vehicle_type: vehicleFilter,
+      spot_type: backendSpotType,
+    });
+    if (categoryFilter === 'ev') params.set('has_ev', 'true');
 
-    const userLatLng = L.latLng(userPos.lat, userPos.lng);
-
-    // B. Calculate Live Distance in Meters to Next Turn Maneuver
-    const targetIdx = Math.min(currentStepIdx + 1, navSteps.length - 1);
-    const targetStep = navSteps[targetIdx];
-
-    if (targetStep?.location) {
-      const [turnLng, turnLat] = targetStep.location;
-      const dMeters = Math.round(userLatLng.distanceTo(L.latLng(turnLat, turnLng)));
-      setDistToNextTurnM(dMeters);
-
-      // Speak pre-turn warning at <= 150 meters
-      if (dMeters <= 150 && dMeters > 35 && !announced150mRef.current) {
-        announced150mRef.current = true;
-        speakInstruction(`In ${dMeters} meters, ${targetStep.instruction}`);
-      }
-
-      // Automatically switch to the next turn when car enters within 30 meters of intersection
-      if (dMeters <= 30) {
-        if (targetIdx === navSteps.length - 1) {
-          speakInstruction("You have arrived at your parking destination.");
-          setNavActive(false);
-        } else {
-          setCurrentStepIdx(targetIdx);
-          announced150mRef.current = false;
-          speakInstruction(`${targetStep.instruction}`);
-        }
-        return;
-      }
-    }
-
-    // C. Live Off-Route Detection (Auto-Reroutes if driver strays > 65m from path)
-    if (routeCoordsRef.current.length > 0 && selectedSpot) {
-      let minRouteDist = Infinity;
-      for (const pt of routeCoordsRef.current) {
-        const d = userLatLng.distanceTo(L.latLng(pt[0], pt[1]));
-        if (d < minRouteDist) minRouteDist = d;
-      }
-      if (minRouteDist > 65) {
-        speakInstruction("Recalculating route from your current position.");
-        buildLiveRoute(userPos, selectedSpot, true);
-      }
-    }
-  }, [userPos, navActive, currentStepIdx, navSteps]);
-
-  // 3. Initialize OpenStreetMap
-  useEffect(() => {
-    if (isPartnerPortal) {
-      loadLedger();
-      return;
-    }
-    const container = L.DomUtil.get("parkgrid-map");
-    if (container != null) container._leaflet_id = null;
-
-    const map = L.map("parkgrid-map", { zoomControl: true }).setView([userPos.lat, userPos.lng], 14);
-    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: "&copy; OpenStreetMap contributors",
-    }).addTo(map);
-
-    markersLayerRef.current = L.layerGroup().addTo(map);
-    routeLayerRef.current = L.layerGroup().addTo(map);
-    mapRef.current = map;
-
-    return () => map.remove();
-  }, [isPartnerPortal]);
-
-  function fetchSpots(lat, lng) {
-    fetch(`${API_BASE}/api/spots?lat=${lat}&lng=${lng}`)
+    fetch(`${API_BASE}/api/spots?${params.toString()}`)
       .then((r) => r.json())
-      .then((d) => setSpots(d.spots || []))
-      .catch((e) => console.error(e));
-  }
+      .then((data) => {
+        setSpots(data.spots || []);
+      })
+      .catch((e) => console.error('Error fetching parking spots:', e))
+      .finally(() => setLoadingSpots(false));
+  }, [categoryFilter, vehicleFilter]);
 
+  // Initial load & when filters change
   useEffect(() => {
-    if (!isPartnerPortal) fetchSpots(userPos.lat, userPos.lng);
-  }, [gpsLocked, isPartnerPortal, activePass]);
+    fetchSpots(userPos.lat, userPos.lng);
+  }, [userPos.lat, userPos.lng, fetchSpots]);
 
-  // 4. Render Map Pins
-  useEffect(() => {
-    if (!mapRef.current || !markersLayerRef.current) return;
-    markersLayerRef.current.clearLayers();
-
-    const carIcon = L.divIcon({
-      className: "user-car-marker",
-      html: `<div class="car-core"></div>`,
-      iconSize: [22, 22],
-    });
-    L.marker([userPos.lat, userPos.lng], { icon: carIcon })
-      .addTo(markersLayerRef.current)
-      .bindPopup("<b>Your Live Car GPS</b>");
-
-    const filtered = spots.filter((s) => filter === "all" || s.spot_type === filter);
-    filtered.forEach((spot) => {
-      if (spot.available_slots <= 0) return;
-      const isMall = spot.spot_type === "mall";
-      const badge = L.divIcon({
-        className: "spot-pin-wrapper",
-        html: `<div class="map-pill ${isMall ? "pill-mall" : "pill-street"}">
-                 ${isMall ? `🏢 ₹${spot.price_per_hour} (${spot.available_slots})` : `🛰️ ${spot.available_slots} free • ${spot.gap_meters}m`}
-               </div>`,
-        iconSize: [96, 30],
-      });
-
-      const m = L.marker([spot.lat, spot.lng], { icon: badge }).addTo(markersLayerRef.current);
-      m.on("click", () => {
-        setSelectedSpot(spot);
-        setNavActive(false);
-        buildLiveRoute(userPos, spot, false);
-      });
-    });
-  }, [spots, filter, userPos]);
-
-  // 5. Build OSRM Route & Extract Live Coordinates
-  async function buildLiveRoute(origin, spot, keepNavActive = false) {
+  // 3. Select Spot & Generate Route
+  const handleSelectSpot = useCallback(async (spot) => {
+    setSelectedSpot(spot);
+    setMobileDrawerState('half');
     if (!mapRef.current || !routeLayerRef.current) return;
+
     routeLayerRef.current.clearLayers();
 
     try {
-      const url = `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${spot.lng},${spot.lat}?overview=full&geometries=geojson&steps=true`;
+      const url = `https://router.project-osrm.org/route/v1/driving/${userPos.lng},${userPos.lat};${spot.lng},${spot.lat}?overview=full&geometries=geojson&steps=true`;
       const res = await fetch(url);
       const data = await res.json();
+
       if (data.routes && data.routes.length > 0) {
         const route = data.routes[0];
         const coords = route.geometry.coordinates.map((c) => [c[1], c[0]]);
         routeCoordsRef.current = coords;
 
+        const isPaid = spot.spot_type === 'mall' || spot.price_per_hour > 0;
         const polyline = L.polyline(coords, {
-          color: spot.spot_type === "mall" ? "#2563eb" : "#16a34a",
+          color: isPaid ? '#2563eb' : '#10b981',
           weight: 6,
           opacity: 0.9,
+          dashArray: isPaid ? null : '8, 8',
         }).addTo(routeLayerRef.current);
 
-        if (!keepNavActive) {
-          mapRef.current.fitBounds(polyline.getBounds(), { padding: [60, 60] });
-        }
+        mapRef.current.fitBounds(polyline.getBounds(), { padding: [70, 70] });
 
         const rawSteps = route.legs?.[0]?.steps || [];
-        const parsedSteps = rawSteps.map((s) => ({
+        const parsed = rawSteps.map((s) => ({
           instruction: formatManeuver(s),
           distanceMeters: Math.round(s.distance),
           location: s.maneuver?.location,
         }));
 
-        setNavSteps(parsedSteps);
+        setNavSteps(parsed);
         setCurrentStepIdx(0);
-        announced150mRef.current = false;
         setRouteInfo({
           distanceKm: (route.distance / 1000).toFixed(1),
           durationMin: Math.max(1, Math.round(route.duration / 60)),
         });
       }
-    } catch (e) {
-      console.error("Routing error:", e);
+    } catch (err) {
+      console.error('OSRM route fetch failed:', err);
     }
-  }
+  }, [userPos]);
 
-  function startHandsFreeNavigation() {
+  // 4. Initialize Leaflet Map (Civilian UI only)
+  useEffect(() => {
+    if (isDeveloperMode || !mapContainerRef.current) return;
+
+    if (mapRef.current) {
+      mapRef.current.remove();
+      mapRef.current = null;
+    }
+
+    const map = L.map(mapContainerRef.current, {
+      zoomControl: false,
+      attributionControl: false,
+    }).setView([userPos.lat, userPos.lng], 14);
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+    }).addTo(map);
+
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    markersLayerRef.current = L.layerGroup().addTo(map);
+    routeLayerRef.current = L.layerGroup().addTo(map);
+
+    // Initial Car Marker
+    const carIcon = L.divIcon({
+      className: 'user-car-marker-container',
+      html: `
+        <div class="user-car-pulse"></div>
+        <div class="user-car-dot"></div>
+      `,
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+    });
+    carMarkerRef.current = L.marker([userPos.lat, userPos.lng], { icon: carIcon, zIndexOffset: 1000 })
+      .addTo(map)
+      .bindPopup('<b>Your Live Vehicle Position</b>');
+
+    mapRef.current = map;
+
+    return () => {
+      if (map) {
+        map.remove();
+        mapRef.current = null;
+      }
+    };
+  }, [isDeveloperMode, userPos.lat, userPos.lng]);
+
+  // Invalidate map size on window resize
+  useEffect(() => {
+    const handleResize = () => {
+      if (mapRef.current) mapRef.current.invalidateSize();
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Update Car Marker position when userPos changes
+  useEffect(() => {
+    if (carMarkerRef.current) {
+      carMarkerRef.current.setLatLng([userPos.lat, userPos.lng]);
+    }
+  }, [userPos]);
+
+  // 5. Render Parking Spot Pins on Map
+  useEffect(() => {
+    if (!mapRef.current || !markersLayerRef.current) return;
+    markersLayerRef.current.clearLayers();
+
+    spots.forEach((spot) => {
+      const isPaid = spot.spot_type === 'mall' || spot.price_per_hour > 0;
+      const isCurSelected = selectedSpot?.id === spot.id;
+
+      const badgeHtml = isPaid
+        ? `<div class="map-pill pill-mall ${isCurSelected ? 'active-pin' : ''}">
+             <span class="pill-icon">🏢</span>
+             <span class="pill-text">₹${spot.price_per_hour}</span>
+             <span class="pill-count">(${spot.available_slots})</span>
+           </div>`
+        : `<div class="map-pill pill-street ${isCurSelected ? 'active-pin' : ''}">
+             <span class="pill-icon">🅿️</span>
+             <span class="pill-text">Free</span>
+             <span class="pill-count">(${spot.available_slots})</span>
+           </div>`;
+
+      const badgeIcon = L.divIcon({
+        className: 'spot-pin-anchor',
+        html: badgeHtml,
+        iconSize: [96, 32],
+        iconAnchor: [48, 16],
+      });
+
+      const marker = L.marker([spot.lat, spot.lng], { icon: badgeIcon })
+        .addTo(markersLayerRef.current);
+
+      marker.on('click', () => {
+        handleSelectSpot(spot);
+      });
+    });
+  }, [spots, selectedSpot, handleSelectSpot]);
+
+  // 6. Start Live Turn-by-Turn Navigation
+  function handleStartNavigation() {
     if (navSteps.length === 0) return;
     setNavActive(true);
-    setCurrentStepIdx(0);
-    announced150mRef.current = false;
+    setMobileDrawerState('collapsed');
     if (mapRef.current) {
-      mapRef.current.flyTo([userPos.lat, userPos.lng], 17);
+      mapRef.current.flyTo([userPos.lat, userPos.lng], 17, { animate: true, duration: 1.2 });
     }
-    speakInstruction(`Live GPS navigation started. ${navSteps[0].instruction}`);
+    speakInstruction(`Starting navigation. ${navSteps[0]?.instruction || 'Follow highlighted route.'}`);
   }
 
-  async function handleSearchPlace(e) {
-    e.preventDefault();
-    if (!searchQuery.trim()) return;
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}`
-    );
-    const data = await res.json();
-    if (data && data.length > 0) {
-      const lat = parseFloat(data[0].lat);
-      const lng = parseFloat(data[0].lon);
-      mapRef.current?.flyTo([lat, lng], 15);
-      fetchSpots(lat, lng);
-    } else {
-      alert("Location not found.");
+  // 7. Interactive Test Drive Simulation
+  function handleStartSimulation() {
+    if (isSimulating) {
+      if (simulationTimerRef.current) clearInterval(simulationTimerRef.current);
+      setIsSimulating(false);
+      return;
     }
-  }
 
-  async function handleBook(e) {
-    e.preventDefault();
-    const res = await fetch(`${API_BASE}/api/book`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        spot_id: selectedSpot.id,
-        spot_name: selectedSpot.name,
-        price_per_hour: selectedSpot.price_per_hour,
-        vehicle_number: vehicleNo,
-        hours: Number(hours),
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data.detail || "Booking failed");
-    setActivePass({ ...data, lat: selectedSpot.lat, lng: selectedSpot.lng });
-    startHandsFreeNavigation();
-  }
+    if (routeCoordsRef.current.length === 0) {
+      alert('Select a parking spot first to build the route before running simulation.');
+      return;
+    }
 
-  async function handleCheckoutPass() {
-    if (!activePass) return;
-    await fetch(`${API_BASE}/api/bookings/${activePass.booking_id}/checkout`, { method: "POST" });
-    setActivePass(null);
-    fetchSpots(userPos.lat, userPos.lng);
-  }
+    setIsSimulating(true);
+    setNavActive(true);
+    setMobileDrawerState('collapsed');
+    speakInstruction('Route preview started.');
 
-  // Partner & Camera Functions
-  async function loadLedger() {
-    const res = await fetch(`${API_BASE}/api/partner/ledger`);
-    setLedger(await res.json());
-  }
+    const coords = [...routeCoordsRef.current];
+    let stepIndex = 0;
+    const totalPoints = coords.length;
 
-  async function startLiveCamera() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: 640, height: 360 },
-      });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        setCameraActive(true);
+    simulationTimerRef.current = setInterval(() => {
+      if (stepIndex >= totalPoints) {
+        clearInterval(simulationTimerRef.current);
+        setIsSimulating(false);
+        setUserSpeedKmh(0);
+        speakInstruction('You have arrived at your parking destination.');
+        return;
       }
-    } catch (err) {
-      alert("Camera permission error: " + err.message);
-    }
-  }
 
-  async function captureAndAnalyzeFrame() {
-    if (!videoRef.current) return;
-    const canvas = document.createElement("canvas");
-    canvas.width = videoRef.current.videoWidth || 640;
-    canvas.height = videoRef.current.videoHeight || 360;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-    const base64Frame = canvas.toDataURL("image/jpeg", 0.8);
+      const pt = coords[stepIndex];
+      setUserPos({ lat: pt[0], lng: pt[1] });
+      setUserSpeedKmh(Math.floor(28 + Math.random() * 12));
 
-    const res = await fetch(`${API_BASE}/api/gods-eye/analyze-frame`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...camConfig,
-        lat: Number(camConfig.lat),
-        lng: Number(camConfig.lng),
-        strip_width_meters: Number(camConfig.strip_width_meters),
-        image_base64: base64Frame,
-      }),
-    });
-    setCvResult(await res.json());
+      if (mapRef.current) {
+        mapRef.current.panTo([pt[0], pt[1]], { animate: true });
+      }
+
+      const targetManeuver = navSteps[currentStepIdx + 1] || navSteps[currentStepIdx];
+      if (targetManeuver?.location) {
+        const [turnLng, turnLat] = targetManeuver.location;
+        const d = Math.round(L.latLng(pt[0], pt[1]).distanceTo(L.latLng(turnLat, turnLng)));
+        setDistToNextTurnM(d);
+
+        if (d <= 40 && currentStepIdx + 1 < navSteps.length) {
+          setCurrentStepIdx((prev) => prev + 1);
+          speakInstruction(navSteps[currentStepIdx + 1].instruction);
+        }
+      }
+
+      stepIndex += 1;
+    }, 450);
   }
 
   useEffect(() => {
-    if (!autoScan || !cameraActive) return;
-    const timer = setInterval(captureAndAnalyzeFrame, 3000);
-    return () => clearInterval(timer);
-  }, [autoScan, cameraActive, camConfig]);
+    return () => {
+      if (simulationTimerRef.current) clearInterval(simulationTimerRef.current);
+    };
+  }, []);
 
-  async function handleAddPartnerSpot(e) {
-    e.preventDefault();
-    await fetch(`${API_BASE}/api/partner/add-spot`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...newLot,
-        lat: Number(newLot.lat),
-        lng: Number(newLot.lng),
-        total_slots: Number(newLot.total_slots),
-        price_per_hour: Number(newLot.price_per_hour),
-      }),
+  // 8. Search Place Autocomplete
+  async function handleSearch(e) {
+    e?.preventDefault();
+    if (!searchQuery.trim()) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/geocode/suggest?q=${encodeURIComponent(searchQuery)}`);
+      const data = await res.json();
+      if (data.suggestions && data.suggestions.length > 0) {
+        setSearchResults(data.suggestions);
+      }
+    } catch (err) {
+      console.error('Search suggestion error:', err);
+    }
+  }
+
+  function handleSelectSearchResult(place) {
+    setSearchResults([]);
+    setSearchQuery(place.name);
+    setUserPos({ lat: place.lat, lng: place.lng });
+    if (mapRef.current) {
+      mapRef.current.flyTo([place.lat, place.lng], 15, { animate: true });
+    }
+    fetchSpots(place.lat, place.lng);
+  }
+
+  // 9. Select City Preset
+  function handleSelectCity(cityName) {
+    setSelectedCity(cityName);
+    const found = CITIES.find((c) => c.name === cityName);
+    if (found) {
+      setUserPos({ lat: found.lat, lng: found.lng });
+      if (mapRef.current) {
+        mapRef.current.flyTo([found.lat, found.lng], 14.5, { animate: true });
+      }
+      fetchSpots(found.lat, found.lng);
+    }
+  }
+
+  // 10. Booking Creation
+  async function handleBook(bookingData) {
+    const res = await fetch(`${API_BASE}/api/book`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(bookingData),
     });
-    alert("Parking Lot Published to Live Map!");
-    setNewLot({ ...newLot, name: "" });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.detail || 'Reservation could not be completed.');
+      return;
+    }
+
+    setActivePass(data);
+    fetchSpots(userPos.lat, userPos.lng);
+    handleStartNavigation();
   }
 
-  if (isPartnerPortal) {
-    return (
-      <div className="partner-shell">
-        <header className="partner-topbar">
-          <div>
-            <h1>ParkGrid Partner & Live God's Eye OpenCV Console</h1>
-            <p>Real-Time Webcam/CCTV Curb Scanner & 10% Mall Commission Ledger</p>
-          </div>
-          <a href="/" className="switch-app-btn">← Back to Driver Map</a>
-        </header>
-
-        {ledger && (
-          <div className="kpi-row">
-            <div className="kpi-box">
-              <span className="kpi-label">Total Bookings</span>
-              <strong className="kpi-value">{ledger.total_bookings}</strong>
-            </div>
-            <div className="kpi-box">
-              <span className="kpi-label">Gross Volume</span>
-              <strong className="kpi-value">₹{ledger.gross_revenue}</strong>
-            </div>
-            <div className="kpi-box kpi-green">
-              <span className="kpi-label">Mall Partner Payout (10%)</span>
-              <strong className="kpi-value">₹{ledger.mall_10pct_share}</strong>
-            </div>
-            <div className="kpi-box">
-              <span className="kpi-label">ParkGrid Net (90%)</span>
-              <strong className="kpi-value">₹{ledger.platform_90pct_net}</strong>
-            </div>
-          </div>
-        )}
-
-        <div className="partner-columns">
-          <div className="panel-card">
-            <h2>🛰️ Live Camera God's Eye Curb Detector (OpenCV)</h2>
-            <p className="panel-desc">
-              Mount a phone or IP camera overlooking a parking curb. OpenCV measures the largest continuous free gap in meters and updates the driver map every 3 seconds.
-            </p>
-            <div className="camera-stage">
-              <video ref={videoRef} autoPlay playsInline muted className="webcam-feed" />
-              {cvResult?.annotated_frame && (
-                <img src={cvResult.annotated_frame} alt="OpenCV Output" className="opencv-overlay" />
-              )}
-            </div>
-            <div className="cam-controls">
-              {!cameraActive ? (
-                <button onClick={startLiveCamera} className="btn-blue">
-                  🎥 Turn On Live Camera
-                </button>
-              ) : (
-                <>
-                  <button onClick={captureAndAnalyzeFrame} className="btn-blue">
-                    📸 Scan Curb Frame Now
-                  </button>
-                  <button
-                    onClick={() => setAutoScan(!autoScan)}
-                    className={autoScan ? "btn-red" : "btn-green"}
-                  >
-                    {autoScan ? "⏹ Stop Auto-Scan" : "▶ Start Live 3s Loop"}
-                  </button>
-                </>
-              )}
-            </div>
-            {cvResult && (
-              <div className={`cv-status-banner ${cvResult.fits_car ? "status-ok" : "status-tight"}`}>
-                <strong>Measured Gap: {cvResult.gap_meters}m</strong>
-                <span>
-                  {cvResult.fits_car
-                    ? `✅ ${cvResult.slots_detected} Spot(s) Live on Map`
-                    : "❌ Under 4.8m — Marked Full"}
-                </span>
-              </div>
-            )}
-            <div className="cam-Inputs">
-              <div>
-                <label>Street / Curb Name</label>
-                <input
-                  value={camConfig.name}
-                  onChange={(e) => setCamConfig({ ...camConfig, name: e.target.value })}
-                />
-              </div>
-              <div>
-                <label>Camera Field Width (Meters)</label>
-                <input
-                  type="number"
-                  value={camConfig.strip_width_meters}
-                  onChange={(e) => setCamConfig({ ...camConfig, strip_width_meters: e.target.value })}
-                />
-              </div>
-              <div>
-                <label>GPS Lat</label>
-                <input
-                  type="number"
-                  step="any"
-                  value={camConfig.lat}
-                  onChange={(e) => setCamConfig({ ...camConfig, lat: e.target.value })}
-                />
-              </div>
-              <div>
-                <label>GPS Lng</label>
-                <input
-                  type="number"
-                  step="any"
-                  value={camConfig.lng}
-                  onChange={(e) => setCamConfig({ ...camConfig, lng: e.target.value })}
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="panel-card">
-            <h2>🏢 Register New Partner Mall / Lot</h2>
-            <form onSubmit={handleAddPartnerSpot} className="add-lot-form">
-              <input
-                placeholder="Mall or Parking Lot Name"
-                value={newLot.name}
-                onChange={(e) => setNewLot({ ...newLot, name: e.target.value })}
-                required
-              />
-              <div className="form-split">
-                <select
-                  value={newLot.spot_type}
-                  onChange={(e) => setNewLot({ ...newLot, spot_type: e.target.value })}
-                >
-                  <option value="mall">Partner Mall (Paid Pre-Book)</option>
-                  <option value="street">Open Street Zone (Free)</option>
-                </select>
-                <input
-                  type="number"
-                  placeholder="Hourly Rate (₹)"
-                  value={newLot.price_per_hour}
-                  onChange={(e) => setNewLot({ ...newLot, price_per_hour: e.target.value })}
-                />
-              </div>
-              <div className="form-split">
-                <input
-                  type="number"
-                  step="any"
-                  placeholder="Latitude"
-                  value={newLot.lat}
-                  onChange={(e) => setNewLot({ ...newLot, lat: e.target.value })}
-                  required
-                />
-                <input
-                  type="number"
-                  step="any"
-                  placeholder="Longitude"
-                  value={newLot.lng}
-                  onChange={(e) => setNewLot({ ...newLot, lng: e.target.value })}
-                  required
-                />
-              </div>
-              <button type="submit" className="btn-blue">
-                + Publish Parking Lot
-              </button>
-            </form>
-
-            <h2 style={{ marginTop: "24px" }}>💰 Live 10% Mall Commission Ledger</h2>
-            <div className="table-scroll">
-              <table className="clean-table">
-                <thead>
-                  <tr>
-                    <th>Pass</th>
-                    <th>Location</th>
-                    <th>Car No</th>
-                    <th>Paid</th>
-                    <th>Mall 10%</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ledger?.bookings?.map((b) => (
-                    <tr key={b.id}>
-                      <td>#{b.id}</td>
-                      <td>{b.spot_name}</td>
-                      <td><span className="plate-tag">{b.vehicle_number}</span></td>
-                      <td>₹{b.gross_amount}</td>
-                      <td className="payout-col">₹{b.mall_share_10pct}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
+  // 11. Checkout & Release Pass
+  async function handleCheckoutPass() {
+    if (!activePass) return;
+    await fetch(`${API_BASE}/api/bookings/${activePass.booking_id}/checkout`, { method: 'POST' });
+    setActivePass(null);
+    fetchSpots(userPos.lat, userPos.lng);
+    alert('Parking bay released. Thank you!');
   }
 
-  const visibleSpots = spots.filter((s) => filter === "all" || s.spot_type === filter);
-  const upcomingStep = navSteps[Math.min(currentStepIdx + 1, navSteps.length - 1)] || navSteps[0];
+  // Mode Toggle helper
+  function toggleDeveloperMode() {
+    const nextDev = !isDeveloperMode;
+    setIsDeveloperMode(nextDev);
+    window.history.pushState(null, '', nextDev ? '/developer' : '/');
+  }
+
+  const visibleSpots = spots;
+  const currentStep = navSteps[currentStepIdx] || navSteps[0];
 
   return (
-    <div className="app-layout">
-      <aside className="left-sidebar">
-        <div className="sidebar-header">
-          <div className="logo-bar">
-            <div>
-              <span className="brand-logo">ParkGrid</span>
-              <span className={`gps-badge ${gpsLocked ? "gps-live" : ""}`}>
-                {gpsLocked ? `● Live GPS (${userSpeedKmh} km/h)` : "● Acquiring GPS..."}
-              </span>
-            </div>
-            <button
-              className="locate-me-btn"
+    <div className={`app-shell ${isDeveloperMode ? 'in-dev-mode' : 'in-civilian-mode'}`}>
+      {/* Top Navbar */}
+      <Navbar
+        isDeveloperMode={isDeveloperMode}
+        onToggleDeveloperMode={toggleDeveloperMode}
+        gpsLocked={gpsLocked}
+        userSpeedKmh={userSpeedKmh}
+        onLocateMe={() => {
+          if (mapRef.current) mapRef.current.flyTo([userPos.lat, userPos.lng], 15);
+          fetchSpots(userPos.lat, userPos.lng);
+        }}
+        selectedCity={selectedCity}
+        onSelectCity={handleSelectCity}
+        cities={CITIES}
+        vehicleFilter={vehicleFilter}
+        setVehicleFilter={setVehicleFilter}
+        hasActivePass={Boolean(activePass)}
+        onOpenPass={() => {
+          if (activePass && mapRef.current) {
+            mapRef.current.flyTo([activePass.lat, activePass.lng], 16);
+          }
+        }}
+      />
+
+      {/* Main Workspace */}
+      {isDeveloperMode ? (
+        /* ============================================================== */
+        /* DEVELOPER USER INTERFACE                                       */
+        /* ============================================================== */
+        <DeveloperConsole
+          onSwitchToCivilian={() => {
+            setIsDeveloperMode(false);
+            window.history.pushState(null, '', '/');
+          }}
+          userPos={userPos}
+          onSpotCreated={() => fetchSpots(userPos.lat, userPos.lng)}
+        />
+      ) : (
+        /* ============================================================== */
+        /* CIVILIAN USER INTERFACE (Driver Public App)                    */
+        /* ============================================================== */
+        <div className="workspace-layout">
+          {/* Left Sidebar / Mobile Bottom Sheet Drawer */}
+          <aside className={`sidebar-container drawer-${mobileDrawerState}`}>
+            {/* Mobile Drag Handle */}
+            <div 
+              className="drawer-drag-handle-bar"
               onClick={() => {
-                mapRef.current?.flyTo([userPos.lat, userPos.lng], 15);
-                fetchSpots(userPos.lat, userPos.lng);
+                setMobileDrawerState((prev) => 
+                  prev === 'collapsed' ? 'half' : prev === 'half' ? 'expanded' : 'collapsed'
+                );
               }}
             >
-              🎯 My Car
-            </button>
-          </div>
-
-          <form onSubmit={handleSearchPlace} className="search-box">
-            <input
-              type="text"
-              placeholder="Search area (e.g. Connaught Place, Hazratganj)..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-            <button type="submit">Go</button>
-          </form>
-
-          <div className="filter-tabs">
-            <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>
-              All ({spots.length})
-            </button>
-            <button className={filter === "mall" ? "active" : ""} onClick={() => setFilter("mall")}>
-              🏢 Partner Malls
-            </button>
-            <button
-              className={filter === "street" ? "active" : ""}
-              onClick={() => setFilter("street")}
-            >
-              🛰️ God's Eye Curb
-            </button>
-          </div>
-        </div>
-
-        {activePass && (
-          <div className="digital-pass">
-            <div className="pass-top">
-              <span className="pass-badge">ACTIVE PASS #{activePass.booking_id}</span>
-              <button onClick={handleCheckoutPass} className="checkout-btn">
-                Release Slot
-              </button>
-            </div>
-            <h4>{activePass.spot_name}</h4>
-            <div className="pass-meta">
-              <span>Car: <b>{activePass.vehicle_number}</b></span>
-              <span>Paid: <b>₹{activePass.gross_amount}</b></span>
-            </div>
-          </div>
-        )}
-
-        <div className="sidebar-content">
-          {selectedSpot ? (
-            <div className="selected-card">
-              <button
-                className="back-link"
-                onClick={() => {
-                  setSelectedSpot(null);
-                  setNavActive(false);
-                }}
-              >
-                ← Back to all {visibleSpots.length} nearby spots
-              </button>
-
-              <span className={`type-pill ${selectedSpot.spot_type}`}>
-                {selectedSpot.spot_type === "mall"
-                  ? "VERIFIED MALL PARTNER"
-                  : `GOD'S EYE CURB GAP • ${selectedSpot.gap_meters}m`}
+              <div className="drag-handle" />
+              <span className="drawer-state-hint">
+                {mobileDrawerState === 'collapsed' ? '▲ Tap to view parking spaces' : '▼ Tap to minimize'}
               </span>
-              <h2>{selectedSpot.name}</h2>
+            </div>
 
-              <div className="route-stats">
-                <div>
-                  <small>Distance</small>
-                  <strong>{routeInfo ? `${routeInfo.distanceKm} km` : `${selectedSpot.distance_km} km`}</strong>
-                </div>
-                {routeInfo && (
-                  <div>
-                    <small>Drive ETA</small>
-                    <strong>{routeInfo.durationMin} mins</strong>
-                  </div>
-                )}
-                <div>
-                  <small>Available Bays</small>
-                  <strong>{selectedSpot.available_slots} open</strong>
-                </div>
-              </div>
-
-              {navSteps.length > 0 && (
-                <button
-                  type="button"
-                  onClick={startHandsFreeNavigation}
-                  className="btn-green full"
-                  style={{ marginBottom: "14px" }}
-                >
-                  🧭 {navActive ? "Hands-Free GPS Tracking Active" : `Start Hands-Free Live Navigation (${routeInfo?.durationMin} min)`}
-                </button>
-              )}
-
-              {selectedSpot.spot_type === "mall" ? (
-                <form onSubmit={handleBook} className="booking-form">
-                  <label>Vehicle Registration Number</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. DL 01 AB 1234"
-                    value={vehicleNo}
-                    onChange={(e) => setVehicleNo(e.target.value)}
-                    required
-                  />
-                  <label>Parking Duration</label>
-                  <select value={hours} onChange={(e) => setHours(e.target.value)}>
-                    <option value={1}>1 Hour — ₹{selectedSpot.price_per_hour}</option>
-                    <option value={2}>2 Hours — ₹{selectedSpot.price_per_hour * 2}</option>
-                    <option value={3}>3 Hours — ₹{selectedSpot.price_per_hour * 3}</option>
-                  </select>
-
-                  <button type="submit" className="btn-blue full">
-                    Lock Bay & Auto-Navigate — ₹{selectedSpot.price_per_hour * hours}
+            {/* Sidebar Search & Civilian Filter Chips */}
+            <div className="sidebar-search-block">
+              <form onSubmit={handleSearch} className="unified-search-box">
+                <Search size={16} className="search-icon" />
+                <input
+                  type="text"
+                  placeholder="Search destination, street or landmark..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                {searchQuery && (
+                  <button 
+                    type="button" 
+                    className="clear-search-btn"
+                    onClick={() => { setSearchQuery(''); setSearchResults([]); }}
+                  >
+                    <X size={14} />
                   </button>
-                </form>
+                )}
+                <button type="submit" className="search-action-btn">
+                  Find
+                </button>
+              </form>
+
+              {/* Autocomplete Dropdown */}
+              {searchResults.length > 0 && (
+                <div className="search-autocomplete-list">
+                  {searchResults.map((p, idx) => (
+                    <div
+                      key={idx}
+                      className="autocomplete-item"
+                      onClick={() => handleSelectSearchResult(p)}
+                    >
+                      <MapPin size={14} className="text-emerald" />
+                      <div>
+                        <strong>{p.name}</strong>
+                        <p>{p.desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Civilian Category Filter Chips */}
+              <div className="category-chips-row">
+                <button
+                  className={`category-chip ${categoryFilter === 'all' ? 'active' : ''}`}
+                  onClick={() => setCategoryFilter('all')}
+                >
+                  All ({spots.length})
+                </button>
+                <button
+                  className={`category-chip ${categoryFilter === 'paid' ? 'active' : ''}`}
+                  onClick={() => setCategoryFilter('paid')}
+                >
+                  <Building2 size={13} />
+                  <span>Paid</span>
+                </button>
+                <button
+                  className={`category-chip ${categoryFilter === 'free' ? 'active' : ''}`}
+                  onClick={() => setCategoryFilter('free')}
+                >
+                  <MapPin size={13} />
+                  <span>Free</span>
+                </button>
+                <button
+                  className={`category-chip ${categoryFilter === 'ev' ? 'active' : ''}`}
+                  onClick={() => setCategoryFilter('ev')}
+                >
+                  <Zap size={13} />
+                  <span>EV Ready</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Active Digital Pass Header Card (if booked) */}
+            {activePass && (
+              <div className="active-pass-pinned-wrapper">
+                <ActivePassCard
+                  pass={activePass}
+                  onCheckout={handleCheckoutPass}
+                  onNavigateToPass={() => {
+                    if (mapRef.current) {
+                      mapRef.current.flyTo([activePass.lat, activePass.lng], 16);
+                    }
+                    handleStartNavigation();
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Sidebar Scrollable Body: Spot Details or Spot List */}
+            <div className="sidebar-scrollable-content">
+              {selectedSpot ? (
+                <SpotDetailDrawer
+                  spot={selectedSpot}
+                  onBack={() => {
+                    setSelectedSpot(null);
+                    setNavActive(false);
+                    if (routeLayerRef.current) routeLayerRef.current.clearLayers();
+                  }}
+                  routeInfo={routeInfo}
+                  onStartNavigation={handleStartNavigation}
+                  onStartSimulation={handleStartSimulation}
+                  isNavigating={navActive}
+                  isSimulating={isSimulating}
+                  onBook={handleBook}
+                />
               ) : (
-                <div className="street-box">
-                  <p>
-                    🛰️ Curb clearance verified at <b>{selectedSpot.gap_meters}m</b> with{" "}
-                    <b>{selectedSpot.available_slots} open bay(s)</b>.
-                  </p>
+                <div className="spots-cards-list">
+                  {loadingSpots ? (
+                    <div className="loading-spots-state">
+                      <Sparkles size={24} className="spin-slow text-emerald" />
+                      <p>Checking available parking spaces...</p>
+                    </div>
+                  ) : visibleSpots.length > 0 ? (
+                    visibleSpots.map((spot) => (
+                      <SpotCard
+                        key={spot.id}
+                        spot={spot}
+                        isSelected={selectedSpot?.id === spot.id}
+                        onSelect={handleSelectSpot}
+                        userVehicleType={vehicleFilter}
+                      />
+                    ))
+                  ) : (
+                    <div className="empty-spots-state">
+                      <MapPin size={28} />
+                      <h4>No parking spaces found here</h4>
+                      <p>Try switching to another area or adjusting vehicle sizing filter.</p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
-          ) : (
-            <div className="spots-list">
-              {visibleSpots.map((spot) => (
-                <div
-                  key={spot.id}
-                  className="spot-item"
-                  onClick={() => {
-                    setSelectedSpot(spot);
-                    setNavActive(false);
-                    buildLiveRoute(userPos, spot, false);
-                  }}
-                >
-                  <div className="spot-info">
-                    <span className={`type-pill ${spot.spot_type}`}>
-                      {spot.spot_type === "mall"
-                        ? "MALL PARTNER"
-                        : `CURB GAP • ${spot.gap_meters}m`}
-                    </span>
-                    <h3>{spot.name}</h3>
-                    <p>
-                      {spot.distance_km} km away • <b>{spot.available_slots} spots open</b>
-                    </p>
-                  </div>
-                  <div className="spot-rate">
-                    {spot.spot_type === "mall" ? (
-                      <>
-                        <strong>₹{spot.price_per_hour}</strong>
-                        <small>/hr</small>
-                      </>
-                    ) : (
-                      <strong className="free-tag">FREE</strong>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </aside>
+          </aside>
 
-      {/* RIGHT STAGE: Map + Hands-Free Auto-Tracking Navigation Banner */}
-      <main className="map-stage">
-        {navActive && upcomingStep && (
-          <div
-            style={{
-              position: "absolute",
-              top: "16px",
-              left: "50%",
-              transform: "translateX(-50%)",
-              zIndex: 1000,
-              background: "#065f46",
-              color: "#ffffff",
-              padding: "16px 22px",
-              borderRadius: "16px",
-              boxShadow: "0 12px 32px rgba(0,0,0,0.35)",
-              minWidth: "350px",
-              maxWidth: "92%",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "18px",
-            }}
-          >
-            <div>
-              <div style={{ fontSize: "0.75rem", color: "#a7f3d0", fontWeight: 700 }}>
-                LIVE GPS AUTO-TRACKING • {userSpeedKmh} KM/H •{" "}
-                {distToNextTurnM !== null ? `IN ${distToNextTurnM} METERS` : "FOLLOW ROUTE"}
-              </div>
-              <div style={{ fontSize: "1.15rem", fontWeight: 800, marginTop: "4px" }}>
-                ↱ {upcomingStep.instruction}
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              <button
-                onClick={() => setVoiceEnabled(!voiceEnabled)}
-                style={{
-                  background: "#047857",
-                  color: "#fff",
-                  border: "none",
-                  padding: "8px 12px",
-                  borderRadius: "8px",
-                  cursor: "pointer",
-                }}
-              >
-                {voiceEnabled ? "🔊" : "🔇"}
-              </button>
-              <button
-                onClick={() => {
+          {/* Map Canvas Stage */}
+          <main className="map-viewport-stage">
+            {/* Floating Live Navigation HUD Banner */}
+            {navActive && currentStep && (
+              <NavigationBanner
+                currentStep={currentStep}
+                distToNextTurnM={distToNextTurnM}
+                userSpeedKmh={userSpeedKmh}
+                voiceEnabled={voiceEnabled}
+                onToggleVoice={() => setVoiceEnabled(!voiceEnabled)}
+                onExitNav={() => {
                   setNavActive(false);
+                  setIsSimulating(false);
+                  if (simulationTimerRef.current) clearInterval(simulationTimerRef.current);
                   window.speechSynthesis?.cancel();
                 }}
-                style={{
-                  background: "#dc2626",
-                  color: "#fff",
-                  border: "none",
-                  padding: "8px 12px",
-                  borderRadius: "8px",
-                  fontWeight: 700,
-                  cursor: "pointer",
+                isSimulating={isSimulating}
+              />
+            )}
+
+            {/* Floating Map Action (Civilian GPS Centering) */}
+            <div className="floating-map-controls">
+              <button
+                className="float-action-btn"
+                onClick={() => {
+                  if (mapRef.current) mapRef.current.flyTo([userPos.lat, userPos.lng], 16);
+                  fetchSpots(userPos.lat, userPos.lng);
                 }}
+                title="Center on My GPS"
               >
-                Exit
+                <LocateFixed size={18} />
               </button>
             </div>
-          </div>
-        )}
-        <div id="parkgrid-map" className="leaflet-full" />
-      </main>
+
+            {/* Leaflet Full-Screen Container */}
+            <div ref={mapContainerRef} className="leaflet-map-canvas" />
+          </main>
+        </div>
+      )}
+
+      {/* Mobile Sticky Bottom Navigation Bar (Civilian Mode) */}
+      {!isDeveloperMode && (
+        <MobileBottomNav
+          activeView="map"
+          onSelectView={(view) => {
+            if (view === 'developer') toggleDeveloperMode();
+            if (view === 'pass' && activePass && mapRef.current) {
+              mapRef.current.flyTo([activePass.lat, activePass.lng], 16);
+            }
+          }}
+          hasActivePass={Boolean(activePass)}
+        />
+      )}
     </div>
   );
 }
