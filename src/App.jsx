@@ -1,1029 +1,826 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CircleMarker, MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet';
-import L from 'leaflet';
-import {
-  Activity,
-  ArrowLeft,
-  Building2,
-  Car,
-  CheckCircle2,
-  Clock3,
-  DollarSign,
-  Eye,
-  Gauge,
-  MapPin,
-  Navigation,
-  Search,
-  ShieldCheck,
-  Sparkles,
-  Timer,
-  TrendingUp,
-  Users,
-  Zap,
-} from 'lucide-react';
-import './App.css';
+import React, { useEffect, useRef, useState } from "react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+import "./App.css";
 
-/* ──────────────────────────── constants ──────────────────────────── */
+// Automatically uses your live Render backend URL in production, or localhost in VS Code
+const API_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
-const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
-const DEFAULT_CENTER = [28.6139, 77.209];
-const CP_CENTER = [28.6315, 77.2167];
+export default function App() {
+  const isPartnerPortal = new URLSearchParams(window.location.search).get("role") === "partner";
 
-const VEHICLE_LENGTH_MAP = {
-  'Compact (< 4m)': 3.6,
-  'Sedan (4m - 4.5m)': 4.2,
-  'SUV (> 4.5m)': 4.8,
-};
+  // Consumer State
+  const [userPos, setUserPos] = useState({ lat: 28.6315, lng: 77.2195 });
+  const [userSpeedKmh, setUserSpeedKmh] = useState(0);
+  const [gpsLocked, setGpsLocked] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [spots, setSpots] = useState([]);
+  const [filter, setFilter] = useState("all");
+  const [selectedSpot, setSelectedSpot] = useState(null);
+  const [routeInfo, setRouteInfo] = useState(null);
+  const [vehicleNo, setVehicleNo] = useState("");
+  const [hours, setHours] = useState(1);
+  const [activePass, setActivePass] = useState(null);
 
-const markerIcon = new L.Icon({
-  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png',
-  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png',
-  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png',
-  iconSize: [25, 41],
-  iconAnchor: [12, 41],
-  popupAnchor: [1, -34],
-  shadowSize: [41, 41],
-});
+  // Hands-Free Live Navigation State
+  const [navSteps, setNavSteps] = useState([]);
+  const [navActive, setNavActive] = useState(false);
+  const [currentStepIdx, setCurrentStepIdx] = useState(0);
+  const [distToNextTurnM, setDistToNextTurnM] = useState(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const announced150mRef = useRef(false);
 
-/* ──────────────────────────── helpers ──────────────────────────── */
+  // Map Refs
+  const mapRef = useRef(null);
+  const markersLayerRef = useRef(null);
+  const routeLayerRef = useRef(null);
+  const routeCoordsRef = useRef([]);
 
-function MapController({ center }) {
-  const map = useMap();
-
-  useEffect(() => {
-    map.invalidateSize();
-    map.flyTo(center, 16, { animate: true, duration: 1.2 });
-  }, [center, map]);
-
-  return null;
-}
-
-async function fetchSuggestions(query, signal) {
-  const params = new URLSearchParams({
-    format: 'jsonv2',
-    q: query,
-    limit: '5',
-    addressdetails: '1',
+  // Partner & Live Camera State (?role=partner)
+  const [ledger, setLedger] = useState(null);
+  const videoRef = useRef(null);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [autoScan, setAutoScan] = useState(false);
+  const [cvResult, setCvResult] = useState(null);
+  const [camConfig, setCamConfig] = useState({
+    spot_id: "CP_BLK_A",
+    name: "CP Inner Circle — Block A Curb",
+    lat: 28.6328,
+    lng: 77.2197,
+    strip_width_meters: 14.0,
+  });
+  const [newLot, setNewLot] = useState({
+    name: "",
+    spot_type: "mall",
+    lat: 28.6315,
+    lng: 77.2195,
+    total_slots: 25,
+    price_per_hour: 40,
   });
 
-  const response = await fetch(`${NOMINATIM_URL}?${params}`, {
-    signal,
-    headers: { Accept: 'application/json' },
-  });
+  function speakInstruction(text) {
+    if (!voiceEnabled || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.02;
+    window.speechSynthesis.speak(utterance);
+  }
 
-  if (!response.ok) throw new Error('Location search failed.');
-  return response.json();
-}
+  function formatManeuver(step) {
+    const type = step.maneuver?.type || "continue";
+    const modifier = step.maneuver?.modifier || "";
+    const road = step.name ? ` onto ${step.name}` : "";
+    if (type === "depart") return `Head ${modifier || "straight"}${road}`;
+    if (type === "arrive") return `You have arrived at your parking spot`;
+    if (type === "turn") return `Turn ${modifier}${road}`;
+    if (type === "roundabout" || type === "rotary") return `Take rotary exit${road}`;
+    return `Continue ${modifier || "straight"}${road}`;
+  }
 
-function formatCurrency(amount) {
-  return `₹${Number(amount).toFixed(2)}`;
-}
-
-function formatCountdown(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
-/* ──────────────────────────── App ──────────────────────────── */
-
-function App() {
-  /* ── core state machine ── */
-  const [appState, setAppState] = useState('search');
-
-  /* ── search state ── */
-  const [searchMode, setSearchMode] = useState('street');
-  const [destination, setDestination] = useState('');
-  const [destinationPoint, setDestinationPoint] = useState(DEFAULT_CENTER);
-  const [carLength, setCarLength] = useState('Compact (< 4m)');
-  const [suggestions, setSuggestions] = useState([]);
-  const [parkingSpot, setParkingSpot] = useState(null);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
-  const [searching, setSearching] = useState(false);
-  const [error, setError] = useState('');
-
-  /* ── driving state ── */
-  const [driverPos, setDriverPos] = useState(null);
-  const [nearbySlots, setNearbySlots] = useState([]);
-  const [simulating, setSimulating] = useState(false);
-  const watchIdRef = useRef(null);
-  const simIntervalRef = useRef(null);
-  const slotPollRef = useRef(null);
-
-  /* ── slot detail / reservation state ── */
-  const [selectedSlot, setSelectedSlot] = useState(null);
-  const [reserving, setReserving] = useState(false);
-  const [reservation, setReservation] = useState(null);
-  const [countdown, setCountdown] = useState(0);
-  const countdownRef = useRef(null);
-
-  /* ── command center state ── */
-  const [godsEyeImg, setGodsEyeImg] = useState('');
-  const [godsEyeStatus, setGodsEyeStatus] = useState(null);
-
-  /* ── partner portal state ── */
-  const [partnerLedger, setPartnerLedger] = useState([]);
-
-  /* ─────────── Nominatim autocomplete ─────────── */
+  // 1. Continuous High-Frequency Live GPS Tracking (100% Hands-Free)
   useEffect(() => {
-    const query = destination.trim();
-    if (query.length < 4) {
-      setSuggestions([]);
-      return undefined;
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(async () => {
-      setLoadingSuggestions(true);
-      try {
-        setSuggestions(await fetchSuggestions(query, controller.signal));
-      } catch (requestError) {
-        if (requestError.name !== 'AbortError') setSuggestions([]);
-      } finally {
-        if (!controller.signal.aborted) setLoadingSuggestions(false);
-      }
-    }, 350);
-
-    return () => {
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [destination]);
-
-  const selectedModeLabel = useMemo(
-    () => (searchMode === 'street' ? 'Live Street Space' : 'Premium Shadowed Lot'),
-    [searchMode],
-  );
-
-  const selectLocation = (location) => {
-    const lat = Number.parseFloat(location.lat);
-    const lon = Number.parseFloat(location.lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-
-    setDestination(location.display_name);
-    setDestinationPoint([lat, lon]);
-    setSuggestions([]);
-    setError('');
-  };
-
-  /* ─────────── search handler ─────────── */
-  const handleSearch = async () => {
-    setSearching(true);
-    setError('');
-
-    try {
-      const response = await fetch(`${API_URL}/api/search`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          destination: destination.trim() || 'Current Location',
-          arrival_time: '1 Minute',
-          search_mode: searchMode,
-          vehicle_length: carLength,
-          latitude: destinationPoint[0],
-          longitude: destinationPoint[1],
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Parking service returned ${response.status}.`);
-      }
-
-      const data = await response.json();
-      const spotLat = Number.isFinite(Number(data.latitude)) ? Number(data.latitude) : destinationPoint[0] + 0.0005;
-      const spotLon = Number.isFinite(Number(data.longitude)) ? Number(data.longitude) : destinationPoint[1] + 0.0005;
-
-      setParkingSpot({
-        lat: spotLat,
-        lon: spotLon,
-        details: data,
-      });
-      setAppState('map');
-    } catch (requestError) {
-      console.error(requestError);
-      setError('Could not reach ParkGrid. Start the FastAPI server and try again.');
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  const resetSearch = () => {
-    setAppState('search');
-    setParkingSpot(null);
-    setError('');
-    stopDriving();
-    setSelectedSlot(null);
-    setReservation(null);
-  };
-
-  const openNavigation = (lat, lng) => {
-    const url = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
-    window.open(url, '_blank', 'noopener,noreferrer');
-  };
-
-  /* ─────────── driving mode - GPS + simulation ─────────── */
-  const startDriving = useCallback(() => {
-    setAppState('driving');
-    setSelectedSlot(null);
-    setReservation(null);
-
-    // Start real GPS
-    if (navigator.geolocation) {
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        (pos) => {
-          if (!simulating) {
-            setDriverPos([pos.coords.latitude, pos.coords.longitude]);
-          }
-        },
-        () => {
-          // GPS error - silently ignore, simulation can be used instead
-        },
-        { enableHighAccuracy: true, maximumAge: 2000 },
-      );
-    }
-  }, [simulating]);
-
-  const stopDriving = useCallback(() => {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-    if (simIntervalRef.current) {
-      clearInterval(simIntervalRef.current);
-      simIntervalRef.current = null;
-    }
-    if (slotPollRef.current) {
-      clearInterval(slotPollRef.current);
-      slotPollRef.current = null;
-    }
-    setSimulating(false);
-    setDriverPos(null);
-    setNearbySlots([]);
+    if (!("geolocation" in navigator)) return;
+    const id = navigator.geolocation.watchPosition(
+      (pos) => {
+        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const speedMs = pos.coords.speed || 0;
+        setUserPos(coords);
+        setUserSpeedKmh(Math.max(0, Math.round(speedMs * 3.6)));
+        setGpsLocked(true);
+      },
+      () => setGpsLocked(false),
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 8000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
   }, []);
 
-  const toggleSimulation = useCallback(() => {
-    if (simulating) {
-      if (simIntervalRef.current) {
-        clearInterval(simIntervalRef.current);
-        simIntervalRef.current = null;
-      }
-      setSimulating(false);
-      return;
-    }
-
-    setSimulating(true);
-    let pos = [...CP_CENTER];
-    setDriverPos(pos);
-
-    simIntervalRef.current = setInterval(() => {
-      pos = [
-        pos[0] + (Math.random() - 0.5) * 0.0006,
-        pos[1] + (Math.random() - 0.5) * 0.0006,
-      ];
-      setDriverPos([...pos]);
-    }, 2000);
-  }, [simulating]);
-
-  // Nearby slot polling when driving
+  // 2. Live Hands-Free Turn-by-Turn Engine (Camera Lock + Live Countdown + Auto-Reroute)
   useEffect(() => {
-    if (appState !== 'driving' || !driverPos) {
-      if (slotPollRef.current) {
-        clearInterval(slotPollRef.current);
-        slotPollRef.current = null;
-      }
-      return;
+    if (!navActive || navSteps.length === 0) return;
+
+    // A. Keep Map Camera Locked onto Moving Car
+    if (mapRef.current) {
+      mapRef.current.panTo([userPos.lat, userPos.lng], { animate: true });
     }
 
-    const fetchSlots = async () => {
-      try {
-        const lengthM = VEHICLE_LENGTH_MAP[carLength] || 3.6;
-        const params = new URLSearchParams({
-          lat: String(driverPos[0]),
-          lng: String(driverPos[1]),
-          radius_m: '500',
-          car_length_m: String(lengthM),
-          zone_type: 'all',
-        });
-        const resp = await fetch(`${API_URL}/api/v1/slots/nearby?${params}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          setNearbySlots(Array.isArray(data) ? data : (data.slots || []));
+    const userLatLng = L.latLng(userPos.lat, userPos.lng);
+
+    // B. Calculate Live Distance in Meters to Next Turn Maneuver
+    const targetIdx = Math.min(currentStepIdx + 1, navSteps.length - 1);
+    const targetStep = navSteps[targetIdx];
+
+    if (targetStep?.location) {
+      const [turnLng, turnLat] = targetStep.location;
+      const dMeters = Math.round(userLatLng.distanceTo(L.latLng(turnLat, turnLng)));
+      setDistToNextTurnM(dMeters);
+
+      // Speak pre-turn warning at <= 150 meters
+      if (dMeters <= 150 && dMeters > 35 && !announced150mRef.current) {
+        announced150mRef.current = true;
+        speakInstruction(`In ${dMeters} meters, ${targetStep.instruction}`);
+      }
+
+      // Automatically switch to the next turn when car enters within 30 meters of intersection
+      if (dMeters <= 30) {
+        if (targetIdx === navSteps.length - 1) {
+          speakInstruction("You have arrived at your parking destination.");
+          setNavActive(false);
+        } else {
+          setCurrentStepIdx(targetIdx);
+          announced150mRef.current = false;
+          speakInstruction(`${targetStep.instruction}`);
         }
-      } catch {
-        // silently continue polling
+        return;
       }
-    };
+    }
 
-    fetchSlots();
-    slotPollRef.current = setInterval(fetchSlots, 3000);
-
-    return () => {
-      if (slotPollRef.current) {
-        clearInterval(slotPollRef.current);
-        slotPollRef.current = null;
+    // C. Live Off-Route Detection (Auto-Reroutes if driver strays > 65m from path)
+    if (routeCoordsRef.current.length > 0 && selectedSpot) {
+      let minRouteDist = Infinity;
+      for (const pt of routeCoordsRef.current) {
+        const d = userLatLng.distanceTo(L.latLng(pt[0], pt[1]));
+        if (d < minRouteDist) minRouteDist = d;
       }
-    };
-  }, [appState, driverPos, carLength]);
+      if (minRouteDist > 65) {
+        speakInstruction("Recalculating route from your current position.");
+        buildLiveRoute(userPos, selectedSpot, true);
+      }
+    }
+  }, [userPos, navActive, currentStepIdx, navSteps]);
 
-  // Cleanup on unmount
+  // 3. Initialize OpenStreetMap
   useEffect(() => {
-    return () => {
-      stopDriving();
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
-  }, [stopDriving]);
+    if (isPartnerPortal) {
+      loadLedger();
+      return;
+    }
+    const container = L.DomUtil.get("parkgrid-map");
+    if (container != null) container._leaflet_id = null;
 
-  /* ─────────── slot detail & reservation ─────────── */
-  const handleSlotClick = (slot) => {
-    setSelectedSlot(slot);
-    setAppState('slot-detail');
-  };
+    const map = L.map("parkgrid-map", { zoomControl: true }).setView([userPos.lat, userPos.lng], 14);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
 
-  const handleReserve = async () => {
-    if (!selectedSlot) return;
-    setReserving(true);
-    try {
-      const resp = await fetch(`${API_URL}/api/v1/bookings/reserve`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          slot_id: selectedSlot.slot_id || selectedSlot.id || 'slot-1',
-          user_id: 'user-app',
-          gross_amount: selectedSlot.price || 0,
-        }),
+    markersLayerRef.current = L.layerGroup().addTo(map);
+    routeLayerRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+
+    return () => map.remove();
+  }, [isPartnerPortal]);
+
+  function fetchSpots(lat, lng) {
+    fetch(`${API_BASE}/api/spots?lat=${lat}&lng=${lng}`)
+      .then((r) => r.json())
+      .then((d) => setSpots(d.spots || []))
+      .catch((e) => console.error(e));
+  }
+
+  useEffect(() => {
+    if (!isPartnerPortal) fetchSpots(userPos.lat, userPos.lng);
+  }, [gpsLocked, isPartnerPortal, activePass]);
+
+  // 4. Render Map Pins
+  useEffect(() => {
+    if (!mapRef.current || !markersLayerRef.current) return;
+    markersLayerRef.current.clearLayers();
+
+    const carIcon = L.divIcon({
+      className: "user-car-marker",
+      html: `<div class="car-core"></div>`,
+      iconSize: [22, 22],
+    });
+    L.marker([userPos.lat, userPos.lng], { icon: carIcon })
+      .addTo(markersLayerRef.current)
+      .bindPopup("<b>Your Live Car GPS</b>");
+
+    const filtered = spots.filter((s) => filter === "all" || s.spot_type === filter);
+    filtered.forEach((spot) => {
+      if (spot.available_slots <= 0) return;
+      const isMall = spot.spot_type === "mall";
+      const badge = L.divIcon({
+        className: "spot-pin-wrapper",
+        html: `<div class="map-pill ${isMall ? "pill-mall" : "pill-street"}">
+                 ${isMall ? `🏢 ₹${spot.price_per_hour} (${spot.available_slots})` : `🛰️ ${spot.available_slots} free • ${spot.gap_meters}m`}
+               </div>`,
+        iconSize: [96, 30],
       });
-      if (resp.ok) {
-        const data = await resp.json();
-        setReservation(data);
-        setCountdown(15 * 60);
 
-        if (countdownRef.current) clearInterval(countdownRef.current);
-        countdownRef.current = setInterval(() => {
-          setCountdown((prev) => {
-            if (prev <= 1) {
-              clearInterval(countdownRef.current);
-              countdownRef.current = null;
-              return 0;
-            }
-            return prev - 1;
-          });
-        }, 1000);
-      } else {
-        setError('Reservation failed. Please try again.');
-      }
-    } catch {
-      setError('Could not reach booking service.');
-    } finally {
-      setReserving(false);
-    }
-  };
+      const m = L.marker([spot.lat, spot.lng], { icon: badge }).addTo(markersLayerRef.current);
+      m.on("click", () => {
+        setSelectedSpot(spot);
+        setNavActive(false);
+        buildLiveRoute(userPos, spot, false);
+      });
+    });
+  }, [spots, filter, userPos]);
 
-  const closeDrawer = () => {
-    setSelectedSlot(null);
-    setReservation(null);
-    if (countdownRef.current) {
-      clearInterval(countdownRef.current);
-      countdownRef.current = null;
-    }
-    if (driverPos) {
-      setAppState('driving');
-    } else {
-      setAppState('search');
-    }
-  };
+  // 5. Build OSRM Route & Extract Live Coordinates
+  async function buildLiveRoute(origin, spot, keepNavActive = false) {
+    if (!mapRef.current || !routeLayerRef.current) return;
+    routeLayerRef.current.clearLayers();
 
-  /* ─────────── command center polling ─────────── */
-  useEffect(() => {
-    if (appState !== 'command-center') return;
+    try {
+      const url = `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${spot.lng},${spot.lat}?overview=full&geometries=geojson&steps=true`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data.routes && data.routes.length > 0) {
+        const route = data.routes[0];
+        const coords = route.geometry.coordinates.map((c) => [c[1], c[0]]);
+        routeCoordsRef.current = coords;
 
-    const fetchStatus = async () => {
-      try {
-        const resp = await fetch(`${API_URL}/api/v1/gods-eye/status`);
-        if (resp.ok) setGodsEyeStatus(await resp.json());
-      } catch {
-        // continue polling
-      }
-    };
+        const polyline = L.polyline(coords, {
+          color: spot.spot_type === "mall" ? "#2563eb" : "#16a34a",
+          weight: 6,
+          opacity: 0.9,
+        }).addTo(routeLayerRef.current);
 
-    const updateImage = () => {
-      setGodsEyeImg(`${API_URL}/api/video_feed?t=${Date.now()}`);
-    };
-
-    fetchStatus();
-    updateImage();
-
-    const statusInterval = setInterval(fetchStatus, 5000);
-    const imageInterval = setInterval(updateImage, 5000);
-
-    return () => {
-      clearInterval(statusInterval);
-      clearInterval(imageInterval);
-    };
-  }, [appState]);
-
-  /* ─────────── partner portal ─────────── */
-  useEffect(() => {
-    if (appState !== 'partner-portal') return;
-
-    const fetchLedger = async () => {
-      try {
-        const resp = await fetch(`${API_URL}/api/v1/partners/ledger`);
-        if (resp.ok) {
-          const data = await resp.json();
-          setPartnerLedger(Array.isArray(data) ? data : (data.partners || []));
+        if (!keepNavActive) {
+          mapRef.current.fitBounds(polyline.getBounds(), { padding: [60, 60] });
         }
-      } catch {
-        // silently ignore
+
+        const rawSteps = route.legs?.[0]?.steps || [];
+        const parsedSteps = rawSteps.map((s) => ({
+          instruction: formatManeuver(s),
+          distanceMeters: Math.round(s.distance),
+          location: s.maneuver?.location,
+        }));
+
+        setNavSteps(parsedSteps);
+        setCurrentStepIdx(0);
+        announced150mRef.current = false;
+        setRouteInfo({
+          distanceKm: (route.distance / 1000).toFixed(1),
+          durationMin: Math.max(1, Math.round(route.duration / 60)),
+        });
       }
-    };
-
-    fetchLedger();
-    const interval = setInterval(fetchLedger, 10000);
-    return () => clearInterval(interval);
-  }, [appState]);
-
-  /* ─────────── map center ─────────── */
-  const mapCenter = useMemo(() => {
-    if (appState === 'driving' && driverPos) return driverPos;
-    if (appState === 'slot-detail' && selectedSlot) {
-      return [selectedSlot.lat || selectedSlot.latitude || destinationPoint[0], selectedSlot.lng || selectedSlot.longitude || destinationPoint[1]];
+    } catch (e) {
+      console.error("Routing error:", e);
     }
-    return destinationPoint;
-  }, [appState, driverPos, selectedSlot, destinationPoint]);
+  }
 
-  /* ─────────── render helpers ─────────── */
-  const slotColor = (slot) => {
-    if (slot.zone_type === 'partner' || slot.type === 'partner') return '#fbbf24';
-    return '#4ade80';
-  };
-
-  const slotLabel = (slot) => {
-    if (slot.zone_type === 'partner' || slot.type === 'partner') {
-      return `${slot.name || 'Mall Slot'} — ₹${slot.price || 80}/hr`;
+  function startHandsFreeNavigation() {
+    if (navSteps.length === 0) return;
+    setNavActive(true);
+    setCurrentStepIdx(0);
+    announced150mRef.current = false;
+    if (mapRef.current) {
+      mapRef.current.flyTo([userPos.lat, userPos.lng], 17);
     }
-    const gap = slot.gap_length_m || slot.length || 0;
-    return `${gap.toFixed(1)}m Curb Gap — Fits ${carLength.split(' ')[0]}`;
-  };
+    speakInstruction(`Live GPS navigation started. ${navSteps[0].instruction}`);
+  }
 
-  /* ═══════════════════════════ RENDER ═══════════════════════════ */
-  return (
-    <div className="app">
-      {/* ─── navbar ─── */}
-      <header className="navbar">
-        <div className="brand">
-          <Navigation className="brand-icon" size={29} strokeWidth={2.6} />
-          <h1 className="brand-name">ParkGrid</h1>
-        </div>
-        <nav className="nav-tabs">
-          <button
-            className={`nav-tab ${appState === 'search' || appState === 'map' ? 'active' : ''}`}
-            onClick={() => { resetSearch(); setAppState('search'); }}
-            type="button"
-          >
-            <Search size={16} /> Search
-          </button>
-          <button
-            className={`nav-tab ${appState === 'driving' || appState === 'slot-detail' ? 'active' : ''}`}
-            onClick={() => { stopDriving(); startDriving(); }}
-            type="button"
-          >
-            <Car size={16} /> Drive
-          </button>
-          <button
-            className={`nav-tab ${appState === 'command-center' ? 'active' : ''}`}
-            onClick={() => { stopDriving(); setAppState('command-center'); }}
-            type="button"
-          >
-            <Eye size={16} /> Command Center
-          </button>
-          <button
-            className={`nav-tab ${appState === 'partner-portal' ? 'active' : ''}`}
-            onClick={() => { stopDriving(); setAppState('partner-portal'); }}
-            type="button"
-          >
-            <Building2 size={16} /> Partner Portal
-          </button>
-        </nav>
-      </header>
+  async function handleSearchPlace(e) {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(searchQuery)}`
+    );
+    const data = await res.json();
+    if (data && data.length > 0) {
+      const lat = parseFloat(data[0].lat);
+      const lng = parseFloat(data[0].lon);
+      mapRef.current?.flyTo([lat, lng], 15);
+      fetchSpots(lat, lng);
+    } else {
+      alert("Location not found.");
+    }
+  }
 
-      <main className="main">
-        {/* ═══════════════ SEARCH VIEW ═══════════════ */}
-        {appState === 'search' && (
-          <section className="search-page">
-            <div className="hero-copy">
-              <p className="eyebrow">Smart parking, without the hunt</p>
-              <h2 className="hero-title">Find your <span>perfect spot.</span></h2>
-              <p className="hero-subtitle">
-                Search around your destination, choose your vehicle size, and let ParkGrid find the best available option.
-              </p>
+  async function handleBook(e) {
+    e.preventDefault();
+    const res = await fetch(`${API_BASE}/api/book`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        spot_id: selectedSpot.id,
+        spot_name: selectedSpot.name,
+        price_per_hour: selectedSpot.price_per_hour,
+        vehicle_number: vehicleNo,
+        hours: Number(hours),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) return alert(data.detail || "Booking failed");
+    setActivePass({ ...data, lat: selectedSpot.lat, lng: selectedSpot.lng });
+    startHandsFreeNavigation();
+  }
+
+  async function handleCheckoutPass() {
+    if (!activePass) return;
+    await fetch(`${API_BASE}/api/bookings/${activePass.booking_id}/checkout`, { method: "POST" });
+    setActivePass(null);
+    fetchSpots(userPos.lat, userPos.lng);
+  }
+
+  // Partner & Camera Functions
+  async function loadLedger() {
+    const res = await fetch(`${API_BASE}/api/partner/ledger`);
+    setLedger(await res.json());
+  }
+
+  async function startLiveCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: 640, height: 360 },
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        setCameraActive(true);
+      }
+    } catch (err) {
+      alert("Camera permission error: " + err.message);
+    }
+  }
+
+  async function captureAndAnalyzeFrame() {
+    if (!videoRef.current) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = videoRef.current.videoWidth || 640;
+    canvas.height = videoRef.current.videoHeight || 360;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    const base64Frame = canvas.toDataURL("image/jpeg", 0.8);
+
+    const res = await fetch(`${API_BASE}/api/gods-eye/analyze-frame`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...camConfig,
+        lat: Number(camConfig.lat),
+        lng: Number(camConfig.lng),
+        strip_width_meters: Number(camConfig.strip_width_meters),
+        image_base64: base64Frame,
+      }),
+    });
+    setCvResult(await res.json());
+  }
+
+  useEffect(() => {
+    if (!autoScan || !cameraActive) return;
+    const timer = setInterval(captureAndAnalyzeFrame, 3000);
+    return () => clearInterval(timer);
+  }, [autoScan, cameraActive, camConfig]);
+
+  async function handleAddPartnerSpot(e) {
+    e.preventDefault();
+    await fetch(`${API_BASE}/api/partner/add-spot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...newLot,
+        lat: Number(newLot.lat),
+        lng: Number(newLot.lng),
+        total_slots: Number(newLot.total_slots),
+        price_per_hour: Number(newLot.price_per_hour),
+      }),
+    });
+    alert("Parking Lot Published to Live Map!");
+    setNewLot({ ...newLot, name: "" });
+  }
+
+  if (isPartnerPortal) {
+    return (
+      <div className="partner-shell">
+        <header className="partner-topbar">
+          <div>
+            <h1>ParkGrid Partner & Live God's Eye OpenCV Console</h1>
+            <p>Real-Time Webcam/CCTV Curb Scanner & 10% Mall Commission Ledger</p>
+          </div>
+          <a href="/" className="switch-app-btn">← Back to Driver Map</a>
+        </header>
+
+        {ledger && (
+          <div className="kpi-row">
+            <div className="kpi-box">
+              <span className="kpi-label">Total Bookings</span>
+              <strong className="kpi-value">{ledger.total_bookings}</strong>
             </div>
-
-            <div className="mode-switch">
-              <div className="mode-group" role="tablist" aria-label="Parking type">
-                <button
-                  className={`mode-button ${searchMode === 'street' ? 'active' : ''}`}
-                  onClick={() => setSearchMode('street')}
-                  role="tab"
-                  aria-selected={searchMode === 'street'}
-                >
-                  <Zap size={18} /> Live Street Space
-                </button>
-                <button
-                  className={`mode-button premium ${searchMode === 'premium' ? 'active' : ''}`}
-                  onClick={() => setSearchMode('premium')}
-                  role="tab"
-                  aria-selected={searchMode === 'premium'}
-                >
-                  <ShieldCheck size={18} /> Premium Lot
-                </button>
-              </div>
+            <div className="kpi-box">
+              <span className="kpi-label">Gross Volume</span>
+              <strong className="kpi-value">₹{ledger.gross_revenue}</strong>
             </div>
-
-            <div className="search-card">
-              <div className="search-grid">
-                <div className="field destination-field">
-                  <label className="field-label" htmlFor="destination">Where to?</label>
-                  <div className="input-row">
-                    <Search className="field-icon" size={21} />
-                    <input
-                      id="destination"
-                      className="destination-input"
-                      value={destination}
-                      onChange={(event) => setDestination(event.target.value)}
-                      placeholder="e.g. Hauz Khas Village"
-                      autoComplete="off"
-                    />
-                  </div>
-                  {(loadingSuggestions || suggestions.length > 0) && (
-                    <div className="suggestions" role="listbox">
-                      {loadingSuggestions && <div className="suggestion">Searching locations…</div>}
-                      {!loadingSuggestions && suggestions.map((location) => (
-                        <button
-                          key={`${location.place_id}-${location.lat}-${location.lon}`}
-                          className="suggestion"
-                          onClick={() => selectLocation(location)}
-                          type="button"
-                        >
-                          {location.display_name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="field">
-                  <label className="field-label" htmlFor="vehicle">Vehicle size</label>
-                  <div className="input-row">
-                    <Car className="field-icon" size={21} />
-                    <select id="vehicle" className="vehicle-select" value={carLength} onChange={(event) => setCarLength(event.target.value)}>
-                      <option>Compact (&lt; 4m)</option>
-                      <option>Sedan (4m - 4.5m)</option>
-                      <option>SUV (&gt; 4.5m)</option>
-                    </select>
-                  </div>
-                </div>
-
-                <button className="search-button" onClick={handleSearch} disabled={searching} type="button">
-                  <Navigation size={20} /> {searching ? 'Finding…' : 'Find Space'}
-                </button>
-              </div>
-
-              {error && <div className="error-banner" role="alert">{error}</div>}
+            <div className="kpi-box kpi-green">
+              <span className="kpi-label">Mall Partner Payout (10%)</span>
+              <strong className="kpi-value">₹{ledger.mall_10pct_share}</strong>
             </div>
-
-            <div className="features">
-              <div className="feature">
-                <Zap size={20} />
-                <h3>Fast discovery</h3>
-                <p>Get a parking recommendation without manually scanning the map.</p>
-              </div>
-              <div className="feature">
-                <Clock3 size={20} />
-                <h3>Arrival aware</h3>
-                <p>Built to keep arrival time and vehicle size in the search flow.</p>
-              </div>
-              <div className="feature">
-                <Sparkles size={20} />
-                <h3>One clear result</h3>
-                <p>A focused result card keeps the next action simple.</p>
-              </div>
+            <div className="kpi-box">
+              <span className="kpi-label">ParkGrid Net (90%)</span>
+              <strong className="kpi-value">₹{ledger.platform_90pct_net}</strong>
             </div>
-          </section>
+          </div>
         )}
 
-        {/* ═══════════════ MAP RESULT VIEW ═══════════════ */}
-        {appState === 'map' && (
-          <section className="map-page">
-            <button className="map-back" onClick={resetSearch} type="button" aria-label="Back to parking search">
-              <ArrowLeft size={22} />
-            </button>
-
-            <div className="map">
-              <MapContainer center={destinationPoint} zoom={15} zoomControl={true}>
-                <TileLayer
-                  attribution='&copy; OpenStreetMap contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        <div className="partner-columns">
+          <div className="panel-card">
+            <h2>🛰️ Live Camera God's Eye Curb Detector (OpenCV)</h2>
+            <p className="panel-desc">
+              Mount a phone or IP camera overlooking a parking curb. OpenCV measures the largest continuous free gap in meters and updates the driver map every 3 seconds.
+            </p>
+            <div className="camera-stage">
+              <video ref={videoRef} autoPlay playsInline muted className="webcam-feed" />
+              {cvResult?.annotated_frame && (
+                <img src={cvResult.annotated_frame} alt="OpenCV Output" className="opencv-overlay" />
+              )}
+            </div>
+            <div className="cam-controls">
+              {!cameraActive ? (
+                <button onClick={startLiveCamera} className="btn-blue">
+                  🎥 Turn On Live Camera
+                </button>
+              ) : (
+                <>
+                  <button onClick={captureAndAnalyzeFrame} className="btn-blue">
+                    📸 Scan Curb Frame Now
+                  </button>
+                  <button
+                    onClick={() => setAutoScan(!autoScan)}
+                    className={autoScan ? "btn-red" : "btn-green"}
+                  >
+                    {autoScan ? "⏹ Stop Auto-Scan" : "▶ Start Live 3s Loop"}
+                  </button>
+                </>
+              )}
+            </div>
+            {cvResult && (
+              <div className={`cv-status-banner ${cvResult.fits_car ? "status-ok" : "status-tight"}`}>
+                <strong>Measured Gap: {cvResult.gap_meters}m</strong>
+                <span>
+                  {cvResult.fits_car
+                    ? `✅ ${cvResult.slots_detected} Spot(s) Live on Map`
+                    : "❌ Under 4.8m — Marked Full"}
+                </span>
+              </div>
+            )}
+            <div className="cam-Inputs">
+              <div>
+                <label>Street / Curb Name</label>
+                <input
+                  value={camConfig.name}
+                  onChange={(e) => setCamConfig({ ...camConfig, name: e.target.value })}
                 />
-                <MapController center={destinationPoint} />
-                {parkingSpot && (
-                  <Marker position={[parkingSpot.lat, parkingSpot.lon]} icon={markerIcon}>
-                    <Popup>Parking space secured.</Popup>
-                  </Marker>
-                )}
-              </MapContainer>
+              </div>
+              <div>
+                <label>Camera Field Width (Meters)</label>
+                <input
+                  type="number"
+                  value={camConfig.strip_width_meters}
+                  onChange={(e) => setCamConfig({ ...camConfig, strip_width_meters: e.target.value })}
+                />
+              </div>
+              <div>
+                <label>GPS Lat</label>
+                <input
+                  type="number"
+                  step="any"
+                  value={camConfig.lat}
+                  onChange={(e) => setCamConfig({ ...camConfig, lat: e.target.value })}
+                />
+              </div>
+              <div>
+                <label>GPS Lng</label>
+                <input
+                  type="number"
+                  step="any"
+                  value={camConfig.lng}
+                  onChange={(e) => setCamConfig({ ...camConfig, lng: e.target.value })}
+                />
+              </div>
             </div>
+          </div>
 
-            <aside className="map-card">
-              <div className="map-card-header">
-                <CheckCircle2 className="success-icon" size={30} />
+          <div className="panel-card">
+            <h2>🏢 Register New Partner Mall / Lot</h2>
+            <form onSubmit={handleAddPartnerSpot} className="add-lot-form">
+              <input
+                placeholder="Mall or Parking Lot Name"
+                value={newLot.name}
+                onChange={(e) => setNewLot({ ...newLot, name: e.target.value })}
+                required
+              />
+              <div className="form-split">
+                <select
+                  value={newLot.spot_type}
+                  onChange={(e) => setNewLot({ ...newLot, spot_type: e.target.value })}
+                >
+                  <option value="mall">Partner Mall (Paid Pre-Book)</option>
+                  <option value="street">Open Street Zone (Free)</option>
+                </select>
+                <input
+                  type="number"
+                  placeholder="Hourly Rate (₹)"
+                  value={newLot.price_per_hour}
+                  onChange={(e) => setNewLot({ ...newLot, price_per_hour: e.target.value })}
+                />
+              </div>
+              <div className="form-split">
+                <input
+                  type="number"
+                  step="any"
+                  placeholder="Latitude"
+                  value={newLot.lat}
+                  onChange={(e) => setNewLot({ ...newLot, lat: e.target.value })}
+                  required
+                />
+                <input
+                  type="number"
+                  step="any"
+                  placeholder="Longitude"
+                  value={newLot.lng}
+                  onChange={(e) => setNewLot({ ...newLot, lng: e.target.value })}
+                  required
+                />
+              </div>
+              <button type="submit" className="btn-blue">
+                + Publish Parking Lot
+              </button>
+            </form>
+
+            <h2 style={{ marginTop: "24px" }}>💰 Live 10% Mall Commission Ledger</h2>
+            <div className="table-scroll">
+              <table className="clean-table">
+                <thead>
+                  <tr>
+                    <th>Pass</th>
+                    <th>Location</th>
+                    <th>Car No</th>
+                    <th>Paid</th>
+                    <th>Mall 10%</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ledger?.bookings?.map((b) => (
+                    <tr key={b.id}>
+                      <td>#{b.id}</td>
+                      <td>{b.spot_name}</td>
+                      <td><span className="plate-tag">{b.vehicle_number}</span></td>
+                      <td>₹{b.gross_amount}</td>
+                      <td className="payout-col">₹{b.mall_share_10pct}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const visibleSpots = spots.filter((s) => filter === "all" || s.spot_type === filter);
+  const upcomingStep = navSteps[Math.min(currentStepIdx + 1, navSteps.length - 1)] || navSteps[0];
+
+  return (
+    <div className="app-layout">
+      <aside className="left-sidebar">
+        <div className="sidebar-header">
+          <div className="logo-bar">
+            <div>
+              <span className="brand-logo">ParkGrid</span>
+              <span className={`gps-badge ${gpsLocked ? "gps-live" : ""}`}>
+                {gpsLocked ? `● Live GPS (${userSpeedKmh} km/h)` : "● Acquiring GPS..."}
+              </span>
+            </div>
+            <button
+              className="locate-me-btn"
+              onClick={() => {
+                mapRef.current?.flyTo([userPos.lat, userPos.lng], 15);
+                fetchSpots(userPos.lat, userPos.lng);
+              }}
+            >
+              🎯 My Car
+            </button>
+          </div>
+
+          <form onSubmit={handleSearchPlace} className="search-box">
+            <input
+              type="text"
+              placeholder="Search area (e.g. Connaught Place, Hazratganj)..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            <button type="submit">Go</button>
+          </form>
+
+          <div className="filter-tabs">
+            <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>
+              All ({spots.length})
+            </button>
+            <button className={filter === "mall" ? "active" : ""} onClick={() => setFilter("mall")}>
+              🏢 Partner Malls
+            </button>
+            <button
+              className={filter === "street" ? "active" : ""}
+              onClick={() => setFilter("street")}
+            >
+              🛰️ God's Eye Curb
+            </button>
+          </div>
+        </div>
+
+        {activePass && (
+          <div className="digital-pass">
+            <div className="pass-top">
+              <span className="pass-badge">ACTIVE PASS #{activePass.booking_id}</span>
+              <button onClick={handleCheckoutPass} className="checkout-btn">
+                Release Slot
+              </button>
+            </div>
+            <h4>{activePass.spot_name}</h4>
+            <div className="pass-meta">
+              <span>Car: <b>{activePass.vehicle_number}</b></span>
+              <span>Paid: <b>₹{activePass.gross_amount}</b></span>
+            </div>
+          </div>
+        )}
+
+        <div className="sidebar-content">
+          {selectedSpot ? (
+            <div className="selected-card">
+              <button
+                className="back-link"
+                onClick={() => {
+                  setSelectedSpot(null);
+                  setNavActive(false);
+                }}
+              >
+                ← Back to all {visibleSpots.length} nearby spots
+              </button>
+
+              <span className={`type-pill ${selectedSpot.spot_type}`}>
+                {selectedSpot.spot_type === "mall"
+                  ? "VERIFIED MALL PARTNER"
+                  : `GOD'S EYE CURB GAP • ${selectedSpot.gap_meters}m`}
+              </span>
+              <h2>{selectedSpot.name}</h2>
+
+              <div className="route-stats">
                 <div>
-                  <h2>{parkingSpot?.details.type || selectedModeLabel}</h2>
-                  <p className="destination">{destination || 'Current Location'}</p>
+                  <small>Distance</small>
+                  <strong>{routeInfo ? `${routeInfo.distanceKm} km` : `${selectedSpot.distance_km} km`}</strong>
+                </div>
+                {routeInfo && (
+                  <div>
+                    <small>Drive ETA</small>
+                    <strong>{routeInfo.durationMin} mins</strong>
+                  </div>
+                )}
+                <div>
+                  <small>Available Bays</small>
+                  <strong>{selectedSpot.available_slots} open</strong>
                 </div>
               </div>
 
-              <div className="cost">
-                <p className="cost-label">Cost</p>
-                <p className="cost-value">{parkingSpot?.details.price || '—'}</p>
+              {navSteps.length > 0 && (
+                <button
+                  type="button"
+                  onClick={startHandsFreeNavigation}
+                  className="btn-green full"
+                  style={{ marginBottom: "14px" }}
+                >
+                  🧭 {navActive ? "Hands-Free GPS Tracking Active" : `Start Hands-Free Live Navigation (${routeInfo?.durationMin} min)`}
+                </button>
+              )}
+
+              {selectedSpot.spot_type === "mall" ? (
+                <form onSubmit={handleBook} className="booking-form">
+                  <label>Vehicle Registration Number</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. DL 01 AB 1234"
+                    value={vehicleNo}
+                    onChange={(e) => setVehicleNo(e.target.value)}
+                    required
+                  />
+                  <label>Parking Duration</label>
+                  <select value={hours} onChange={(e) => setHours(e.target.value)}>
+                    <option value={1}>1 Hour — ₹{selectedSpot.price_per_hour}</option>
+                    <option value={2}>2 Hours — ₹{selectedSpot.price_per_hour * 2}</option>
+                    <option value={3}>3 Hours — ₹{selectedSpot.price_per_hour * 3}</option>
+                  </select>
+
+                  <button type="submit" className="btn-blue full">
+                    Lock Bay & Auto-Navigate — ₹{selectedSpot.price_per_hour * hours}
+                  </button>
+                </form>
+              ) : (
+                <div className="street-box">
+                  <p>
+                    🛰️ Curb clearance verified at <b>{selectedSpot.gap_meters}m</b> with{" "}
+                    <b>{selectedSpot.available_slots} open bay(s)</b>.
+                  </p>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="spots-list">
+              {visibleSpots.map((spot) => (
+                <div
+                  key={spot.id}
+                  className="spot-item"
+                  onClick={() => {
+                    setSelectedSpot(spot);
+                    setNavActive(false);
+                    buildLiveRoute(userPos, spot, false);
+                  }}
+                >
+                  <div className="spot-info">
+                    <span className={`type-pill ${spot.spot_type}`}>
+                      {spot.spot_type === "mall"
+                        ? "MALL PARTNER"
+                        : `CURB GAP • ${spot.gap_meters}m`}
+                    </span>
+                    <h3>{spot.name}</h3>
+                    <p>
+                      {spot.distance_km} km away • <b>{spot.available_slots} spots open</b>
+                    </p>
+                  </div>
+                  <div className="spot-rate">
+                    {spot.spot_type === "mall" ? (
+                      <>
+                        <strong>₹{spot.price_per_hour}</strong>
+                        <small>/hr</small>
+                      </>
+                    ) : (
+                      <strong className="free-tag">FREE</strong>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </aside>
+
+      {/* RIGHT STAGE: Map + Hands-Free Auto-Tracking Navigation Banner */}
+      <main className="map-stage">
+        {navActive && upcomingStep && (
+          <div
+            style={{
+              position: "absolute",
+              top: "16px",
+              left: "50%",
+              transform: "translateX(-50%)",
+              zIndex: 1000,
+              background: "#065f46",
+              color: "#ffffff",
+              padding: "16px 22px",
+              borderRadius: "16px",
+              boxShadow: "0 12px 32px rgba(0,0,0,0.35)",
+              minWidth: "350px",
+              maxWidth: "92%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "18px",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: "0.75rem", color: "#a7f3d0", fontWeight: 700 }}>
+                LIVE GPS AUTO-TRACKING • {userSpeedKmh} KM/H •{" "}
+                {distToNextTurnM !== null ? `IN ${distToNextTurnM} METERS` : "FOLLOW ROUTE"}
               </div>
-
-              <p className="message">{parkingSpot?.details.message}</p>
-
-              <button className="navigate-button" onClick={() => parkingSpot && openNavigation(parkingSpot.lat, parkingSpot.lon)} type="button">
-                Navigate to space
-              </button>
-            </aside>
-          </section>
-        )}
-
-        {/* ═══════════════ DRIVING VIEW ═══════════════ */}
-        {(appState === 'driving' || appState === 'slot-detail') && (
-          <section className="map-page">
-            <div className="driving-controls">
-              <button className="map-back" onClick={resetSearch} type="button" aria-label="Back to search">
-                <ArrowLeft size={22} />
+              <div style={{ fontSize: "1.15rem", fontWeight: 800, marginTop: "4px" }}>
+                ↱ {upcomingStep.instruction}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+              <button
+                onClick={() => setVoiceEnabled(!voiceEnabled)}
+                style={{
+                  background: "#047857",
+                  color: "#fff",
+                  border: "none",
+                  padding: "8px 12px",
+                  borderRadius: "8px",
+                  cursor: "pointer",
+                }}
+              >
+                {voiceEnabled ? "🔊" : "🔇"}
               </button>
               <button
-                className={`sim-toggle ${simulating ? 'active' : ''}`}
-                onClick={toggleSimulation}
-                type="button"
+                onClick={() => {
+                  setNavActive(false);
+                  window.speechSynthesis?.cancel();
+                }}
+                style={{
+                  background: "#dc2626",
+                  color: "#fff",
+                  border: "none",
+                  padding: "8px 12px",
+                  borderRadius: "8px",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
               >
-                <MapPin size={16} />
-                {simulating ? 'Stop Simulation' : 'Simulate Driving in CP'}
+                Exit
               </button>
-              <div className="field driving-vehicle-field">
-                <Car className="field-icon" size={18} />
-                <select className="vehicle-select" value={carLength} onChange={(e) => setCarLength(e.target.value)}>
-                  <option>Compact (&lt; 4m)</option>
-                  <option>Sedan (4m - 4.5m)</option>
-                  <option>SUV (&gt; 4.5m)</option>
-                </select>
-              </div>
             </div>
-
-            <div className="map">
-              <MapContainer center={mapCenter} zoom={16} zoomControl={true}>
-                <TileLayer
-                  attribution='&copy; OpenStreetMap contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                />
-                <MapController center={mapCenter} />
-
-                {/* Driver position - blue pulsing circle */}
-                {driverPos && (
-                  <CircleMarker
-                    center={driverPos}
-                    radius={12}
-                    pathOptions={{
-                      color: '#3b82f6',
-                      fillColor: '#3b82f6',
-                      fillOpacity: 0.5,
-                      weight: 3,
-                      className: 'pulse-blue',
-                    }}
-                  >
-                    <Popup>Your position</Popup>
-                  </CircleMarker>
-                )}
-
-                {/* Nearby slots */}
-                {nearbySlots.map((slot, idx) => (
-                  <CircleMarker
-                    key={slot.slot_id || slot.id || `slot-${idx}`}
-                    center={[slot.lat || slot.latitude || 0, slot.lng || slot.longitude || 0]}
-                    radius={9}
-                    pathOptions={{
-                      color: slotColor(slot),
-                      fillColor: slotColor(slot),
-                      fillOpacity: 0.55,
-                      weight: 2,
-                      className: (slot.zone_type === 'partner' || slot.type === 'partner') ? 'pulse-gold' : 'pulse-green',
-                    }}
-                    eventHandlers={{
-                      click: () => handleSlotClick(slot),
-                    }}
-                  >
-                    <Popup>{slotLabel(slot)}</Popup>
-                  </CircleMarker>
-                ))}
-              </MapContainer>
-            </div>
-
-            {/* GPS indicator */}
-            {driverPos && (
-              <div className="gps-indicator">
-                <span className="gps-dot" />
-                GPS {simulating ? 'Simulated' : 'Active'} — {driverPos[0].toFixed(4)}, {driverPos[1].toFixed(4)}
-              </div>
-            )}
-
-            {/* Slot count badge */}
-            {nearbySlots.length > 0 && (
-              <div className="slot-count-badge">
-                <Activity size={16} /> {nearbySlots.length} slot{nearbySlots.length !== 1 ? 's' : ''} nearby
-              </div>
-            )}
-
-            {/* ── Slot Detail Drawer ── */}
-            {appState === 'slot-detail' && selectedSlot && (
-              <div className="slot-drawer">
-                <div className="drawer-handle" />
-                <button className="drawer-close" onClick={closeDrawer} type="button">&times;</button>
-
-                {!reservation ? (
-                  <>
-                    <div className="drawer-badge-row">
-                      {(selectedSlot.zone_type === 'partner' || selectedSlot.type === 'partner') ? (
-                        <span className="drawer-badge badge-gold"><Building2 size={14} /> Verified Mall Partner</span>
-                      ) : (
-                        <span className="drawer-badge badge-green"><Eye size={14} /> God&apos;s Eye Street</span>
-                      )}
-                    </div>
-
-                    <h3 className="drawer-title">
-                      {selectedSlot.name || `Street Gap #${selectedSlot.slot_id || selectedSlot.id || '?'}`}
-                    </h3>
-
-                    <div className="drawer-info-grid">
-                      <div className="drawer-info-item">
-                        <span className="drawer-info-label">Gap / Bay</span>
-                        <span className="drawer-info-value">{(selectedSlot.gap_length_m || selectedSlot.length || 0).toFixed(1)}m</span>
-                      </div>
-                      <div className="drawer-info-item">
-                        <span className="drawer-info-label">Price</span>
-                        <span className="drawer-info-value">
-                          {(selectedSlot.zone_type === 'partner' || selectedSlot.type === 'partner')
-                            ? `₹${selectedSlot.price || 80}/hr`
-                            : 'Free — Street'}
-                        </span>
-                      </div>
-                      <div className="drawer-info-item">
-                        <span className="drawer-info-label">Fits</span>
-                        <span className="drawer-info-value">{carLength}</span>
-                      </div>
-                    </div>
-
-                    <button
-                      className="reserve-button"
-                      onClick={handleReserve}
-                      disabled={reserving}
-                      type="button"
-                    >
-                      <Timer size={18} />
-                      {reserving ? 'Reserving…' : `Reserve for 15 Min — ₹${selectedSlot.price || 0}`}
-                    </button>
-
-                    {(selectedSlot.zone_type === 'partner' || selectedSlot.type === 'partner') && (
-                      <p className="revenue-split">
-                        Mall Partner earns {formatCurrency((selectedSlot.price || 80) * 0.10)} (10%)
-                      </p>
-                    )}
-                  </>
-                ) : (
-                  <div className="reservation-confirmed">
-                    <CheckCircle2 className="confirmed-icon" size={40} />
-                    <h3>Reservation Confirmed!</h3>
-                    <p className="confirmed-slot">
-                      {selectedSlot.name || `Slot ${selectedSlot.slot_id || selectedSlot.id || ''}`}
-                    </p>
-
-                    <div className="countdown-ring">
-                      <Timer size={24} />
-                      <span className="countdown-value">{formatCountdown(countdown)}</span>
-                      <span className="countdown-label">remaining</span>
-                    </div>
-
-                    <button
-                      className="navigate-button"
-                      onClick={() => openNavigation(
-                        selectedSlot.lat || selectedSlot.latitude || destinationPoint[0],
-                        selectedSlot.lng || selectedSlot.longitude || destinationPoint[1],
-                      )}
-                      type="button"
-                    >
-                      <Navigation size={18} /> Navigate to Bay
-                    </button>
-
-                    {(selectedSlot.zone_type === 'partner' || selectedSlot.type === 'partner') && (
-                      <p className="revenue-split">
-                        Mall Partner earns {formatCurrency((selectedSlot.price || 80) * 0.10)} (10%)
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {error && <div className="error-banner" role="alert">{error}</div>}
-              </div>
-            )}
-          </section>
+          </div>
         )}
-
-        {/* ═══════════════ COMMAND CENTER ═══════════════ */}
-        {appState === 'command-center' && (
-          <section className="command-center">
-            <div className="cc-header">
-              <Eye size={24} />
-              <h2>God&apos;s Eye Command Center</h2>
-            </div>
-            <div className="cc-split">
-              <div className="cc-left">
-                <h3 className="cc-pane-title">Live Overhead Feed</h3>
-                <div className="cc-image-container">
-                  {godsEyeImg ? (
-                    <img
-                      src={godsEyeImg}
-                      alt="God's Eye overhead view"
-                      className="cc-feed-img"
-                      onError={(e) => { e.target.style.display = 'none'; }}
-                    />
-                  ) : (
-                    <div className="cc-no-feed">
-                      <Eye size={48} />
-                      <p>Connecting to feed…</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="cc-right">
-                <h3 className="cc-pane-title">Detection Status</h3>
-                {godsEyeStatus ? (
-                  <div className="cc-status-grid">
-                    <div className="cc-stat-card">
-                      <Activity size={20} />
-                      <div className="cc-stat-info">
-                        <span className="cc-stat-value">{godsEyeStatus.active_zones ?? godsEyeStatus.activeZones ?? 0}</span>
-                        <span className="cc-stat-label">Active Zones</span>
-                      </div>
-                    </div>
-                    <div className="cc-stat-card">
-                      <Gauge size={20} />
-                      <div className="cc-stat-info">
-                        <span className="cc-stat-value">{godsEyeStatus.total_slots ?? godsEyeStatus.totalSlots ?? 0}</span>
-                        <span className="cc-stat-label">Total Slots</span>
-                      </div>
-                    </div>
-                    <div className="cc-stat-card cc-stat-green">
-                      <CheckCircle2 size={20} />
-                      <div className="cc-stat-info">
-                        <span className="cc-stat-value">{godsEyeStatus.available ?? 0}</span>
-                        <span className="cc-stat-label">Available</span>
-                      </div>
-                    </div>
-                    <div className="cc-stat-card cc-stat-red">
-                      <Car size={20} />
-                      <div className="cc-stat-info">
-                        <span className="cc-stat-value">{godsEyeStatus.occupied ?? 0}</span>
-                        <span className="cc-stat-label">Occupied</span>
-                      </div>
-                    </div>
-                    <div className="cc-stat-card cc-stat-amber">
-                      <Zap size={20} />
-                      <div className="cc-stat-info">
-                        <span className="cc-stat-value">{godsEyeStatus.too_tight ?? godsEyeStatus.tooTight ?? 0}</span>
-                        <span className="cc-stat-label">Too Tight</span>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="cc-loading">
-                    <Activity size={24} className="spin" />
-                    <p>Loading status…</p>
-                  </div>
-                )}
-
-                {godsEyeStatus?.gaps && Array.isArray(godsEyeStatus.gaps) && godsEyeStatus.gaps.length > 0 && (
-                  <div className="cc-gaps-section">
-                    <h4 className="cc-gaps-title">Dynamic Gaps Detected</h4>
-                    <div className="cc-gaps-list">
-                      {godsEyeStatus.gaps.map((gap, idx) => (
-                        <div key={gap.id || `gap-${idx}`} className="cc-gap-item">
-                          <MapPin size={14} />
-                          <span className="cc-gap-length">{(gap.length_m || gap.length || 0).toFixed(1)}m</span>
-                          <span className="cc-gap-status">{gap.status || 'available'}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* ═══════════════ PARTNER PORTAL ═══════════════ */}
-        {appState === 'partner-portal' && (
-          <section className="partner-portal">
-            <div className="pp-header">
-              <Building2 size={24} />
-              <h2>Partner Portal Dashboard</h2>
-            </div>
-
-            {partnerLedger.length === 0 ? (
-              <div className="pp-empty">
-                <Building2 size={48} />
-                <p>Loading partner data…</p>
-              </div>
-            ) : (
-              <div className="pp-grid">
-                {partnerLedger.map((partner, idx) => {
-                  const totalSlots = partner.total_slots ?? partner.totalSlots ?? 0;
-                  const occupied = partner.occupied ?? 0;
-                  const available = partner.available ?? (totalSlots - occupied);
-                  const occupancyPct = totalSlots > 0 ? ((occupied / totalSlots) * 100).toFixed(0) : 0;
-                  const gross = partner.gross_revenue ?? partner.grossRevenue ?? 0;
-                  const commission = gross * 0.10;
-                  const bookings = partner.total_bookings ?? partner.totalBookings ?? 0;
-
-                  return (
-                    <div key={partner.partner_id || partner.id || `partner-${idx}`} className="pp-card">
-                      <div className="pp-card-header">
-                        <Building2 size={22} className="pp-card-icon" />
-                        <div>
-                          <h3 className="pp-card-name">{partner.name || `Partner ${idx + 1}`}</h3>
-                          <p className="pp-card-location">
-                            <MapPin size={13} /> {partner.location || partner.address || 'Location not set'}
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="pp-stats-row">
-                        <div className="pp-stat">
-                          <span className="pp-stat-val">{totalSlots}</span>
-                          <span className="pp-stat-lbl">Total Slots</span>
-                        </div>
-                        <div className="pp-stat">
-                          <span className="pp-stat-val pp-stat-occupied">{occupied}</span>
-                          <span className="pp-stat-lbl">Occupied</span>
-                        </div>
-                        <div className="pp-stat">
-                          <span className="pp-stat-val pp-stat-available">{available}</span>
-                          <span className="pp-stat-lbl">Available</span>
-                        </div>
-                      </div>
-
-                      <div className="pp-occupancy">
-                        <div className="pp-occupancy-header">
-                          <span>Occupancy</span>
-                          <span className="pp-occupancy-pct">{occupancyPct}%</span>
-                        </div>
-                        <div className="pp-occupancy-bar">
-                          <div className="pp-occupancy-fill" style={{ width: `${occupancyPct}%` }} />
-                        </div>
-                      </div>
-
-                      <div className="pp-revenue-row">
-                        <div className="pp-revenue-item">
-                          <DollarSign size={16} />
-                          <div>
-                            <span className="pp-revenue-val">{formatCurrency(gross)}</span>
-                            <span className="pp-revenue-lbl">Gross Revenue</span>
-                          </div>
-                        </div>
-                        <div className="pp-revenue-item pp-commission">
-                          <TrendingUp size={16} />
-                          <div>
-                            <span className="pp-commission-val">{formatCurrency(commission)}</span>
-                            <span className="pp-revenue-lbl">10% Commission</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="pp-bookings">
-                        <Users size={15} />
-                        <span>{bookings} total booking{bookings !== 1 ? 's' : ''}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        )}
+        <div id="parkgrid-map" className="leaflet-full" />
       </main>
     </div>
   );
 }
-
-export default App;
